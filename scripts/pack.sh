@@ -3,7 +3,7 @@
 # Usage: scripts/pack.sh [out.zip]   → default dist/game-<version>-<date>.zip
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VER=$(grep -oE 'G\.VERSION *= *["'"'"'][^"'"'"']+' game/js/main.js 2>/dev/null | head -1 | sed -E 's/.*["'"'"']//' || true)
+VER=$(grep -oE 'G\.VERSION *= *["'"'"'][^"'"'"']+' game/js/config.js game/js/main.js 2>/dev/null | head -1 | sed -E 's/.*["'"'"']//' || true)
 VER=${VER:-dev}
 OUT=${1:-dist/game-${VER}-$(date +%Y%m%d).zip}
 mkdir -p "$(dirname "$OUT")"
