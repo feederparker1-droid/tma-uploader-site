@@ -259,6 +259,42 @@ test('init(): precedence opts.lang > ?lang= > stored > sdk user > navigator', ()
   assert.equal(load({ search: '?lang=klingon', languages: nav }).i18n.init(), 'de', 'unsupported ?lang= is ignored');
 });
 
+test('init(): an unsupported candidate falls through to the next source, not straight to navigator', () => {
+  const sdk = { user: { lang: 'tr' } };
+  assert.equal(load({ search: '?lang=klingon', languages: ['de-DE'], sdk }).i18n.init(), 'tr');
+  assert.equal(load({ search: '?lang=klingon', languages: ['de-DE'], sdk }).i18n.init({ lang: 'xx' }), 'tr');
+  const storage = memoryStorage({ lang: 'fr' });
+  assert.equal(load({ languages: ['de-DE'], storage, sdk: { user: { lang: 'zz' } } }).i18n.init(), 'fr');
+  assert.equal(load({ languages: ['de-DE'], storage: memoryStorage({ lang: { v: 'tr' } }), sdk }).i18n.init(), 'tr', 'non-string stored value is ignored');
+  assert.equal(load({ languages: ['de-DE'] }).i18n.init({ lang: 42 }), 'de');
+});
+
+test('init(): survives a throwing G.sdk.user getter and a missing document', () => {
+  const ctx = load({ languages: ['ru-RU'], sdk: { get user() { throw new Error('boom'); } } });
+  assert.equal(ctx.i18n.init(), 'ru');
+  ctx.sandbox.document = undefined;
+  assert.equal(ctx.i18n.init({ lang: 'tr' }), 'tr');
+  assert.equal(ctx.i18n.setLang('de'), 'de');
+  assert.equal(ctx.i18n.apply(), undefined);
+});
+
+test('Object.prototype names are never treated as keys or languages', () => {
+  const { i18n } = load();
+  for (const bad of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+    assert.equal(i18n.t(bad), bad);
+    assert.equal(i18n.t(bad, { x: 1 }), bad);
+    assert.equal(i18n.has(bad), false);
+    assert.equal(i18n.nativeName(bad), bad);
+    assert.equal(i18n.dir(bad), 'ltr');
+    assert.equal(i18n.setLang(bad), 'en');
+    assert.equal(i18n.detect([bad]), 'en');
+  }
+  assert.equal(i18n.t(), 'undefined');
+  assert.equal(i18n.t(123), '123');
+  assert.equal(i18n.t('unlockFor', 'not-an-object'), 'Unlock for {cost}');
+  assert.equal(i18n.t('unlockFor', Object.create({ cost: 5 })), 'Unlock for 5');
+});
+
 test('init(): survives a broken storage module', () => {
   const storage = { get: () => { throw new Error('blocked'); }, set: () => { throw new Error('blocked'); } };
   const ctx = load({ languages: ['pt-PT'], storage });
@@ -310,6 +346,15 @@ test('fmtNumber(): locale grouping with Latin digits everywhere', () => {
   assert.match(i18n.fmtNumber(1234567), /^1[,٬]234[,٬]567$/);
   assert.equal(i18n.fmtNumber(NaN), '0');
   assert.equal(i18n.fmtNumber('42'), '42');
+  assert.equal(i18n.fmtNumber(-0), '0');
+  assert.equal(i18n.fmtNumber(-0.4), '0');
+  assert.equal(i18n.fmtNumber(Infinity), '0');
+  assert.equal(i18n.fmtNumber(null), '0');
+  assert.equal(i18n.fmtNumber(undefined), '0');
+  assert.equal(i18n.fmtNumber(12n), '12');
+  i18n.setLang('en');
+  assert.equal(i18n.fmtNumber(Number.MAX_SAFE_INTEGER), '9,007,199,254,740,991');
+  assert.equal(i18n.fmtNumber(1e21), '1,000,000,000,000,000,000,000');
 });
 
 test('fmtNumber(): falls back to manual grouping without Intl', () => {
@@ -319,6 +364,57 @@ test('fmtNumber(): falls back to manual grouping without Intl', () => {
   assert.equal(ctx.i18n.fmtNumber(1234567), '1,234,567');
   assert.equal(ctx.i18n.fmtNumber(-1000), '-1,000');
   assert.equal(ctx.i18n.fmtNumber(999), '999');
+  assert.equal(ctx.i18n.fmtNumber(-0), '0');
+  assert.equal(ctx.i18n.fmtNumber(1e21), '1,000,000,000,000,000,000,000', 'no exponent form for huge values');
+  assert.equal(ctx.i18n.fmtNumber(-1e21), '-1,000,000,000,000,000,000,000');
+  ctx.i18n.setLang('tr');
+  assert.equal(ctx.i18n.fmtNumber(1234567), '1,234,567', 'fallback grouping is used for every language');
+});
+
+test('setLang(): falls back to document.createEvent when CustomEvent is not a constructor', () => {
+  const ctx = load();
+  ctx.sandbox.CustomEvent = {};
+  let created = null;
+  ctx.sandbox.document.createEvent = (type) => {
+    created = { type, initCustomEvent(name, bubbles, cancelable, detail) { this.name = name; this.detail = detail; } };
+    return created;
+  };
+  assert.equal(ctx.i18n.setLang('fr'), 'fr');
+  assert.equal(created.type, 'CustomEvent');
+  assert.equal(created.name, 'g:lang');
+  assert.deepEqual(plain(created.detail), { lang: 'fr', dir: 'ltr' });
+  assert.equal(ctx.events.length, 1);
+  assert.equal(ctx.events[0], created);
+
+  ctx.sandbox.document = undefined;
+  assert.equal(ctx.i18n.setLang('de'), 'de', 'no event sink at all is still safe');
+  assert.equal(ctx.events.length, 1);
+});
+
+test('rapid repeated setLang/init calls stay consistent and emit one event per call', () => {
+  const storage = memoryStorage();
+  const ctx = load({ storage });
+  const codes = ['tr', 'ar', 'en', 'hi', 'ar', 'tr', 'tr'];
+  for (const code of codes) assert.equal(ctx.i18n.setLang(code), code);
+  assert.equal(ctx.events.length, codes.length);
+  assert.equal(ctx.i18n.lang, 'tr');
+  assert.equal(ctx.htmlAttrs.dir, 'ltr');
+  assert.equal(storage.data.lang, 'tr');
+  assert.equal(ctx.i18n.init(), 'tr', 'init re-reads the persisted choice');
+  assert.equal(ctx.i18n.init(), 'tr', 'double init is idempotent');
+  assert.equal(ctx.events.length, codes.length, 'init does not emit g:lang');
+});
+
+test('module adds nothing to window except G', () => {
+  const ctx = load();
+  const before = new Set(Object.keys(load().sandbox));
+  const extra = Object.keys(ctx.sandbox).filter((k) => !before.has(k));
+  assert.deepEqual(extra, []);
+  assert.deepEqual(Object.keys(ctx.G).sort(), ['DEBUG', 'i18n', 'log']);
+  assert.ok(!/^\s*(import|export)\b/m.test(source), 'must stay a classic script');
+  assert.ok(/'use strict'/.test(source));
+  assert.ok(!/\bfetch\(|XMLHttpRequest|<script/.test(source), 'zero network');
+  assert.ok(!/console\.(log|warn|error|info|debug)\(/.test(source.replace(/G\.log = G\.log \|\|[^\n]*/, '')), 'console only via G.log');
 });
 
 test('DEBUG flag is derived from ?debug=1 and kept when already set', () => {

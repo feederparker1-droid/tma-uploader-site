@@ -274,7 +274,8 @@ describe('mirrors: debounced push', () => {
     await sleep(500);
     deepEq(m.calls, []);
     await sleep(500);
-    deepEq(m.calls, [['set', 'score', env(3, 7)]]);
+    // Three writes in the same millisecond get strictly increasing stamps (7, 8, 9).
+    deepEq(m.calls, [['set', 'score', env(3, 9)]]);
   });
 
   test('pushes the raw envelope string, unprefixed key, to every mirror', async () => {
@@ -516,7 +517,8 @@ describe('export / import', () => {
       { key: 'score', source: 'import' },
       { key: 'settings', source: 'import' },
     ]);
-    assert.equal(b.S.export(), JSON.stringify({ ...snapshot, exportedAt: JSON.parse(b.S.export()).exportedAt }));
+    // Re-exporting the imported store yields the identical data section.
+    deepEq(JSON.parse(b.S.export()).data, snapshot.data);
   });
 
   test('accepts a plain {key: value} object, stamping the current time', () => {
@@ -544,6 +546,203 @@ describe('export / import', () => {
     S.import(JSON.stringify({ format: 1, data: { k: { v: 1, _ts: 5 } } }));
     await sleep(40);
     deepEq(m.calls, [['set', 'k', env(1, 5)]]);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Regressions found in review                                          */
+/* ------------------------------------------------------------------ */
+
+describe('memory layer precedence and tombstones', () => {
+  test('a rejected rewrite of an existing key is read back (memory beats stale backend)', () => {
+    const { S, ls } = load({ now: 1 });
+    S.set('ok', 1);
+    ls.setItem = () => { throw new DOMException('quota', 'QuotaExceededError'); };
+    assert.equal(S.set('ok', 2), true);
+    assert.equal(S.get('ok'), 2);
+    assert.equal(JSON.parse(ls.getItem('g1.ok')).v, 1);
+    assert.equal(S.export().includes('"v":2'), true);
+  });
+
+  test('a rejected removal leaves a tombstone: key reads as gone until written again', () => {
+    const { S, ls } = load();
+    S.set('k', 1);
+    const realRemove = ls.removeItem.bind(ls);
+    ls.removeItem = () => { throw new DOMException('denied', 'SecurityError'); };
+    assert.equal(S.remove('k'), true);
+    assert.equal(S.get('k', 'gone'), 'gone');
+    assert.equal(S.timestamp('k'), 0);
+    deepEq(S.keys(), []);
+    assert.equal(S.remove('k'), false);
+    ls.removeItem = realRemove;
+    S.set('k', 2);
+    assert.equal(S.get('k'), 2);
+    deepEq(S.keys(), ['k']);
+  });
+
+  test('values without a JSON form are rejected by set and skipped by import', () => {
+    const { S } = load();
+    assert.equal(S.set('fn', function () {}), false);
+    assert.equal(S.set('sym', Symbol('s')), false);
+    assert.equal(S.set('toJsonUndef', { toJSON() { return undefined; } }), false);
+    assert.equal(S.get('fn', 'absent'), 'absent');
+    deepEq(S.import({ good: 1, bad: () => 1 }), { ok: true, imported: 1 });
+    deepEq(S.keys(), ['good']);
+  });
+
+  test('set(key, undefined) reports acceptance even when the key was absent', () => {
+    const { S } = load();
+    assert.equal(S.set('nothing', undefined), true);
+    deepEq(S.keys(), []);
+  });
+});
+
+describe('monotonic timestamps', () => {
+  test('writes in the same millisecond get strictly increasing stamps', () => {
+    const { S } = load({ now: 50 });
+    S.set('k', 1);
+    S.set('k', 2);
+    S.set('k', 3);
+    assert.equal(S.timestamp('k'), 52);
+    S.set('other', 1);
+    assert.equal(S.timestamp('other'), 50);
+  });
+
+  test('a local write after adopting a future-stamped mirror copy still wins the next pull', async () => {
+    const { S, clock } = load({ now: 100 });
+    const m = makeMirror('cloud', new Map([['k', env('remote', 5000)]]));
+    S.attachMirror(m);
+    await S.pullMirrors(['k']);
+    assert.equal(S.get('k'), 'remote');
+    clock.now = 200;
+    S.set('k', 'mine');
+    assert.equal(S.timestamp('k'), 5001);
+    await S.pullMirrors(['k']);
+    assert.equal(S.get('k'), 'mine');
+    assert.equal(m.store.get('k'), env('mine', 5001));
+  });
+});
+
+describe('remove and get bookkeeping', () => {
+  test('removing a missing key is a local no-op but still reaches the mirrors', async () => {
+    const { S, events } = load();
+    const m = makeMirror('cloud', new Map([['ghost', env(1, 1)]]));
+    S.attachMirror(m);
+    const rev = S.rev;
+    assert.equal(S.remove('ghost'), false);
+    assert.equal(S.rev, rev);
+    deepEq(events, []);
+    await sleep(0);
+    deepEq(m.calls, [['remove', 'ghost']]);
+    assert.equal(m.store.has('ghost'), false);
+  });
+
+  test('get() of a key written behind our back makes it appear in keys()', () => {
+    const { S, ls } = load();
+    S.init();
+    ls.setItem('g1.sneaky', env(1, 1));
+    deepEq(S.keys(), []);
+    assert.equal(S.get('sneaky'), 1);
+    deepEq(S.keys(), ['sneaky']);
+  });
+
+  test('double init installs the lifecycle hooks once (one flush per pagehide)', () => {
+    const { S, win } = load({ now: 1 });
+    S.init();
+    S.init();
+    const m = makeMirror('cloud');
+    S.attachMirror(m);
+    S.set('k', 1);
+    win.dispatchEvent(new Event('pagehide'));
+    deepEq(m.calls, [['set', 'k', env(1, 1)]]);
+  });
+});
+
+describe('pullMirrors concurrency', () => {
+  test('a set() made while mirrors are being read is compared with its real timestamp', async () => {
+    const { S, clock } = load({ now: 100 });
+    let release;
+    const m = {
+      name: 'slow',
+      calls: [],
+      get: () => new Promise((r) => { release = () => r(env('remote', 150)); }),
+      async set(k, v) { this.calls.push(['set', k, v]); },
+      async remove() {},
+    };
+    S.attachMirror(m);
+    S.set('k', 'old');
+    const pull = S.pullMirrors(['k']);
+    await sleep(5);
+    clock.now = 200;
+    S.set('k', 'newLocal');
+    release();
+    await pull;
+    assert.equal(S.get('k'), 'newLocal');
+    assert.equal(S.timestamp('k'), 200);
+    deepEq(m.calls, [['set', 'k', env('newLocal', 200)]]);
+    await sleep(900);
+    assert.equal(m.calls.length, 1);
+  });
+
+  test('a mirror detached during a pull is not written to afterwards', async () => {
+    const { S } = load({ now: 100 });
+    let release;
+    const m = {
+      name: 'late',
+      calls: [],
+      get: () => new Promise((r) => { release = () => r(null); }),
+      async set(k, v) { this.calls.push(['set', k, v]); },
+      async remove() {},
+    };
+    S.set('k', 1);
+    S.attachMirror(m);
+    const pull = S.pullMirrors(['k']);
+    await sleep(5);
+    S.detachMirror('late');
+    release();
+    await pull;
+    deepEq(m.calls, []);
+  });
+
+  test('accepts a single key string', async () => {
+    const { S } = load({ now: 1 });
+    const m = makeMirror('cloud', new Map([['solo', env('s', 9)]]));
+    S.attachMirror(m);
+    await S.pullMirrors('solo');
+    assert.equal(S.get('solo'), 's');
+  });
+});
+
+describe('cross-tab storage events (synthetic)', () => {
+  const storageEvent = (win, props) => Object.assign(new Event('storage'), props);
+
+  test('external set / remove update the manifest and emit source external', () => {
+    const { S, ls, win, events } = load();
+    S.init();
+    ls.setItem('g1.tab', env(1, 1));
+    win.dispatchEvent(storageEvent(win, { key: 'g1.tab', newValue: env(1, 1), storageArea: ls }));
+    deepEq(S.keys(), ['tab']);
+    assert.equal(S.get('tab'), 1);
+    ls.removeItem('g1.tab');
+    win.dispatchEvent(storageEvent(win, { key: 'g1.tab', newValue: null, storageArea: ls }));
+    deepEq(S.keys(), []);
+    deepEq(events, [{ key: 'tab', source: 'external' }, { key: 'tab', source: 'external' }]);
+  });
+
+  test('external clear() emits for every vanished key; foreign keys and areas are ignored', () => {
+    const { S, ls, win, events } = load();
+    S.set('a', 1);
+    S.set('b', 2);
+    events.length = 0;
+    win.dispatchEvent(storageEvent(win, { key: 'other.x', newValue: '1', storageArea: ls }));
+    win.dispatchEvent(storageEvent(win, { key: 'g1.a', newValue: null, storageArea: {} }));
+    deepEq(events, []);
+    deepEq(S.keys(), ['a', 'b']);
+    ls.clear();
+    win.dispatchEvent(storageEvent(win, { key: null, newValue: null, storageArea: ls }));
+    deepEq(S.keys(), []);
+    deepEq(events.map((e) => e.key).sort(), ['a', 'b']);
+    assert.equal(events.every((e) => e.source === 'external'), true);
   });
 });
 
@@ -620,5 +819,33 @@ describe('browser (Playwright/Chromium)', () => {
     assert.equal(result.score, 7);
     deepEq(result.keys, ['score']);
     await page.close();
+  });
+
+  test('a write in one tab is visible in another tab as an external g:storage event', async () => {
+    const context = await browser.newContext();
+    const writer = await context.newPage();
+    const reader = await context.newPage();
+    await writer.goto(pageUrl());
+    await reader.goto(pageUrl());
+    await reader.evaluate(() => {
+      window.seen = [];
+      window.addEventListener('g:storage', (e) => window.seen.push(e.detail));
+      window.G.storage.init();
+    });
+    await writer.evaluate(() => { window.G.storage.set('xtab', { from: 'writer' }); });
+    await reader.waitForFunction(() => window.seen.length > 0, null, { timeout: 5000 });
+    const state = await reader.evaluate(() => ({
+      seen: window.seen,
+      keys: window.G.storage.keys(),
+      value: window.G.storage.get('xtab'),
+    }));
+    deepEq(state.seen, [{ key: 'xtab', source: 'external' }]);
+    deepEq(state.keys, ['xtab']);
+    deepEq(state.value, { from: 'writer' });
+    await writer.evaluate(() => { window.G.storage.remove('xtab'); });
+    await reader.waitForFunction(() => window.seen.length > 1, null, { timeout: 5000 });
+    deepEq(await reader.evaluate(() => window.G.storage.keys()), []);
+    await writer.evaluate(() => localStorage.clear());
+    await context.close();
   });
 });

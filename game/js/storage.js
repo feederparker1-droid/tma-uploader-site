@@ -8,14 +8,18 @@
  *   - Every value is stored as an envelope  {"v": <value>, "_ts": <epoch ms>}
  *     so that copies living in different places (localStorage, Telegram
  *     CloudStorage, CrazyGames data API, ...) can be reconciled: the newest
- *     timestamp wins, in both directions.
+ *     timestamp wins, in both directions. Local stamps are monotonic per key
+ *     (never below the stamp already stored), so a device with a slow clock can
+ *     still overwrite a copy it previously adopted from a mirror.
  *   - Survives incognito / blocked storage: the availability probe and every
  *     single localStorage access are wrapped in try/catch, and the module falls
  *     back to an in-memory Map that behaves identically for the session.
  *   - Mirrors (attachMirror) receive debounced, fire-and-forget pushes on set()
  *     and immediate removes on remove(); pullMirrors() merges remote copies back.
  *   - Emits a window 'g:storage' CustomEvent {detail:{key, source}} after every
- *     mutation so UI code can react without polling.
+ *     mutation so UI code can react without polling. Writes made by another tab
+ *     of the same origin are picked up through the native 'storage' event and
+ *     re-emitted with source 'external'.
  *   - export() / import() produce and consume a JSON snapshot for support.
  *
  * Classic script (IIFE), no dependencies, works from file://.
@@ -44,7 +48,13 @@
 
   /** @type {Storage|null} the real localStorage once it passed the probe. */
   var backend = null;
-  /** @type {Map<string,string>} in-memory fallback, keyed by the PREFIXED key. */
+  /**
+   * In-memory layer keyed by the PREFIXED key. Holds everything when there is
+   * no backend, and otherwise only what the backend refused: a string for a
+   * rejected write, `null` as a tombstone for a rejected removal. An entry here
+   * is therefore always fresher than the backend copy and is read first.
+   * @type {Map<string,(string|null)>}
+   */
   var memory = new Map();
   /** @type {Set<string>} manifest of logical (unprefixed) keys known to exist. */
   var manifest = new Set();
@@ -61,6 +71,11 @@
   /** @param {string} key @returns {string} the physical key. */
   function physical(key) {
     return PREFIX + key;
+  }
+
+  /** @param {string} pkey @returns {boolean} true when pkey is one of ours (probe excluded). */
+  function isOurs(pkey) {
+    return typeof pkey === 'string' && pkey.indexOf(PREFIX) === 0 && pkey !== PROBE_KEY;
   }
 
   /** @param {*} key @returns {boolean} true when key is a usable logical key. */
@@ -85,6 +100,25 @@
   }
 
   /**
+   * Serialises an envelope. Returns null when the value has no JSON form
+   * (functions, symbols, cyclic structures, toJSON returning undefined) so that
+   * callers never store an envelope without a `v`.
+   * @param {{v:*, _ts:number}} env
+   * @returns {string|null}
+   */
+  function serialise(env) {
+    var body;
+    try {
+      body = JSON.stringify(env.v);
+    } catch (err) {
+      G.log('[storage] value is not serialisable:', err);
+      return null;
+    }
+    if (body === undefined) return null;
+    return '{"v":' + body + ',"_ts":' + env._ts + '}';
+  }
+
+  /**
    * Parses a raw stored string into an envelope. Tolerates corrupted JSON and
    * legacy raw values (which are promoted to an envelope with _ts = 0 so that any
    * timestamped copy beats them).
@@ -105,50 +139,50 @@
   }
 
   /**
-   * Reads the raw string for a physical key: the backend first, then the memory
-   * bucket (which also holds writes the backend rejected mid-session).
+   * Reads the raw string for a physical key. The memory layer wins because it
+   * only ever holds writes/removals the backend refused, i.e. the newest state.
+   * @returns {string|null}
    */
   function readRaw(pkey) {
+    if (memory.has(pkey)) return memory.get(pkey);
     if (backend) {
       try {
         var raw = backend.getItem(pkey);
-        if (raw !== null && raw !== undefined) return raw;
+        if (typeof raw === 'string') return raw;
       } catch (err) {
-        G.log('[storage] getItem failed, using memory:', err);
+        G.log('[storage] getItem failed:', err);
       }
     }
-    return memory.has(pkey) ? memory.get(pkey) : null;
+    return null;
   }
 
   /**
    * Writes a raw string for a physical key. Falls back to memory when the
    * backend rejects the write (quota exceeded, storage revoked mid-session).
-   * @returns {boolean} true when the value is held somewhere.
    */
   function writeRaw(pkey, raw) {
     if (backend) {
       try {
         backend.setItem(pkey, raw);
         memory.delete(pkey);
-        return true;
+        return;
       } catch (err) {
         G.log('[storage] setItem failed, using memory:', err);
       }
     }
     memory.set(pkey, raw);
-    return true;
   }
 
-  /** Deletes a physical key from every place it might live. */
+  /** Deletes a physical key from every place it might live (tombstone on failure). */
   function deleteRaw(pkey) {
-    if (backend) {
-      try {
-        backend.removeItem(pkey);
-      } catch (err) {
-        G.log('[storage] removeItem failed:', err);
-      }
-    }
     memory.delete(pkey);
+    if (!backend) return;
+    try {
+      backend.removeItem(pkey);
+    } catch (err) {
+      G.log('[storage] removeItem failed, tombstoning:', err);
+      memory.set(pkey, null);
+    }
   }
 
   /** Dispatches the 'g:storage' event; never throws. */
@@ -168,6 +202,19 @@
     else manifest.delete(key);
     storage.rev++;
     emit(key, source);
+  }
+
+  /**
+   * Timestamp for a local write of `key`: the current clock, but never below
+   * the stamp already stored for that key (plus one), so the write always wins
+   * a merge against the copy it replaces even when this device's clock lags.
+   * @param {string} key
+   * @returns {number}
+   */
+  function stampFor(key) {
+    var now = Date.now();
+    var current = parseEnvelope(readRaw(physical(key)));
+    return current && current._ts >= now ? current._ts + 1 : now;
   }
 
   /**
@@ -239,23 +286,23 @@
     }, storage.debounceMs));
   }
 
-  /** Rebuilds the manifest from the active backend (prefix scan) and memory. */
+  /** Rebuilds the manifest from the active backend (prefix scan) and the memory layer. */
   function rebuildManifest() {
     manifest.clear();
     if (backend) {
       try {
         for (var i = 0; i < backend.length; i++) {
           var pkey = backend.key(i);
-          if (pkey && pkey.indexOf(PREFIX) === 0 && pkey !== PROBE_KEY) {
-            manifest.add(pkey.slice(PREFIX.length));
-          }
+          if (isOurs(pkey)) manifest.add(pkey.slice(PREFIX.length));
         }
       } catch (err) {
         G.log('[storage] key scan failed:', err);
       }
     }
-    memory.forEach(function (_, pkey) {
-      manifest.add(pkey.slice(PREFIX.length));
+    memory.forEach(function (raw, pkey) {
+      var key = pkey.slice(PREFIX.length);
+      if (raw === null) manifest.delete(key);
+      else manifest.add(key);
     });
   }
 
@@ -274,11 +321,37 @@
     }
   }
 
-  /** Flushes pending pushes when the page is about to disappear. */
+  /**
+   * Handles the native 'storage' event fired when ANOTHER document of this
+   * origin writes localStorage: keeps the manifest honest and re-emits as a
+   * 'g:storage' event with source 'external'. Nothing is pushed to mirrors
+   * (the writing tab owns that).
+   * @param {StorageEvent} ev
+   */
+  function onExternalStorage(ev) {
+    if (!ev || ev.storageArea !== backend) return;
+    if (ev.key === null) {
+      // localStorage.clear() elsewhere: everything we knew about is gone.
+      var known = Array.from(manifest);
+      memory.clear();
+      rebuildManifest();
+      known.forEach(function (key) { if (!manifest.has(key)) emit(key, 'external'); });
+      return;
+    }
+    if (!isOurs(ev.key)) return;
+    var key = ev.key.slice(PREFIX.length);
+    memory.delete(physical(key));
+    if (typeof ev.newValue === 'string') manifest.add(key);
+    else manifest.delete(key);
+    emit(key, 'external');
+  }
+
+  /** Flushes pending pushes when the page is about to disappear; listens for cross-tab writes. */
   function installLifecycleHooks() {
     try {
       if (typeof window.addEventListener !== 'function') return;
-      window.addEventListener('pagehide', storage.flush);
+      window.addEventListener('pagehide', function () { storage.flush(); });
+      if (backend) window.addEventListener('storage', onExternalStorage);
       if (window.document && typeof window.document.addEventListener === 'function') {
         window.document.addEventListener('visibilitychange', function () {
           if (window.document.hidden) storage.flush();
@@ -296,20 +369,22 @@
 
   /**
    * Reconciles one key between local storage and every mirror.
-   * The copy with the newest _ts wins; losers are overwritten.
+   * The copy with the newest _ts wins; losers are overwritten. The local copy
+   * is read AFTER the mirrors answered, so a set() made while the mirrors were
+   * being queried is compared with its real timestamp instead of a stale one.
    * @param {string} key
    * @returns {Promise<void>}
    */
   function reconcileKey(key) {
-    var localRaw = readRaw(physical(key));
-    var local = parseEnvelope(localRaw);
     var candidates = mirrors.map(function (mirror) {
       return callMirror(mirror, 'get', [key]).then(function (raw) {
         var env = parseEnvelope(raw);
-        return { mirror: mirror, raw: typeof raw === 'string' ? raw : null, env: env };
+        return { mirror: mirror, raw: env ? raw : null, env: env };
       });
     });
     return Promise.all(candidates).then(function (remotes) {
+      var localRaw = readRaw(physical(key));
+      var local = parseEnvelope(localRaw);
       var bestTs = local ? local._ts : -1;
       var bestRaw = local ? localRaw : null;
       var winner = null;
@@ -321,16 +396,17 @@
         }
       });
       if (bestRaw === null) return;
+      // Whatever the outcome, every holder is brought up to date below, so a
+      // pending debounced push of this key would only duplicate work.
+      cancelTimer(key);
       if (winner) {
-        // Store the remote copy verbatim (keeps its _ts) and announce it.
-        var normalised = JSON.stringify(parseEnvelope(bestRaw));
-        writeRaw(physical(key), normalised);
-        cancelTimer(key);
+        // Store the remote copy normalised (keeps its _ts) and announce it.
+        bestRaw = serialise(parseEnvelope(bestRaw));
+        writeRaw(physical(key), bestRaw);
         commit(key, true, 'mirror:' + winner.name);
-        bestRaw = normalised;
       }
       remotes.forEach(function (remote) {
-        if (remote.mirror === winner) return;
+        if (remote.mirror === winner || mirrors.indexOf(remote.mirror) === -1) return;
         if (!remote.env || remote.env._ts < bestTs) pushToMirror(remote.mirror, key, bestRaw);
       });
     });
@@ -382,7 +458,9 @@
       ensureInit();
       if (!isValidKey(key)) return fallback;
       var env = parseEnvelope(readRaw(physical(key)));
-      return env ? env.v : fallback;
+      if (!env) return fallback;
+      manifest.add(key);
+      return env.v;
     },
 
     /**
@@ -404,17 +482,19 @@
      * Passing `undefined` removes the key (mirrors JSON semantics).
      * @param {string} key
      * @param {*} value
-     * @returns {boolean} true when the write was accepted
+     * @returns {boolean} true when the write (or removal) was accepted; false for
+     *   an invalid key or a value without a JSON form (function, symbol, cycle).
      */
     set: function (key, value) {
       ensureInit();
       if (!isValidKey(key)) return false;
-      if (value === undefined) return storage.remove(key);
-      var raw;
-      try {
-        raw = JSON.stringify(envelope(value, Date.now()));
-      } catch (err) {
-        G.log('[storage] value for', key, 'is not serialisable:', err);
+      if (value === undefined) {
+        storage.remove(key);
+        return true;
+      }
+      var raw = serialise(envelope(value, stampFor(key)));
+      if (raw === null) {
+        G.log('[storage] set rejected: value for', key, 'has no JSON form');
         return false;
       }
       writeRaw(physical(key), raw);
@@ -425,6 +505,8 @@
 
     /**
      * Deletes a key locally and (immediately, fire & forget) from every mirror.
+     * Removing a key that does not exist is a no-op locally (no rev bump, no
+     * event) but is still forwarded to the mirrors so stray remote copies die.
      * @param {string} key
      * @returns {boolean} true when the key existed
      */
@@ -434,7 +516,7 @@
       var existed = manifest.has(key) || readRaw(physical(key)) !== null;
       cancelTimer(key);
       deleteRaw(physical(key));
-      commit(key, false, 'local');
+      if (existed) commit(key, false, 'local');
       for (var i = 0; i < mirrors.length; i++) callMirror(mirrors[i], 'remove', [key]);
       return existed;
     },
@@ -456,6 +538,8 @@
      *   Keys are handed over UNPREFIXED so adapters can apply provider-specific rules
      *   (e.g. Telegram CloudStorage allows only [A-Za-z0-9_-]). `maxLength`, when set,
      *   skips pushes whose serialised value would exceed the provider's limit.
+     *   Attaching a mirror with the name of an existing one replaces it. Call
+     *   pullMirrors() afterwards to reconcile what was written before the attach.
      * @returns {function():void} detach function; also available as detachMirror(name).
      */
     attachMirror: function (mirror) {
@@ -495,12 +579,13 @@
      * newest _ts wins and is written to every place holding an older copy
      * (local included). Local writes made this way emit 'g:storage' with
      * source 'mirror:<name>' and bump rev. Never throws, never rejects.
-     * @param {string[]} [keys] defaults to the union of local keys and every mirror's bulkKeys()
+     * @param {string[]|string} [keys] defaults to the union of local keys and every mirror's bulkKeys()
      * @returns {Promise<void>}
      */
     pullMirrors: function (keys) {
       ensureInit();
       if (!mirrors.length) return Promise.resolve();
+      if (typeof keys === 'string') keys = [keys];
       var listing = Array.isArray(keys)
         ? Promise.resolve(keys.filter(isValidKey))
         : collectKeys();
@@ -553,7 +638,8 @@
      * Restores a snapshot produced by export(). Also accepts a plain
      * {key: value} object (values are stamped with the current time). Envelope
      * timestamps are preserved. Each imported key emits 'g:storage' and is
-     * pushed to the mirrors through the usual debounce.
+     * pushed to the mirrors through the usual debounce. Entries without a JSON
+     * form are skipped and not counted.
      * @param {string|Object} json
      * @returns {{ok:boolean, imported:number, error?:string}}
      */
@@ -575,12 +661,9 @@
       Object.keys(data).forEach(function (key) {
         if (!isValidKey(key)) return;
         var entry = data[key];
-        var env = isEnvelope(entry) ? entry : envelope(entry, Date.now());
-        var raw;
-        try {
-          raw = JSON.stringify(env);
-        } catch (err) {
-          G.log('[storage] import skipped unserialisable key', key);
+        var raw = serialise(isEnvelope(entry) ? entry : envelope(entry, Date.now()));
+        if (raw === null) {
+          G.log('[storage] import skipped key without JSON form:', key);
           return;
         }
         writeRaw(physical(key), raw);

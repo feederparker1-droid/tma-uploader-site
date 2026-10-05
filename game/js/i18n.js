@@ -853,6 +853,17 @@
   var current = DEFAULT_LANG;
   var formatters = {};
 
+  /**
+   * Own-property lookup. Every table above is a plain object, so a key such as
+   * 'constructor' or '__proto__' would otherwise resolve through Object.prototype.
+   * @param {Object} table
+   * @param {*} key
+   * @returns {*} the value, or undefined when `table` has no own property `key`
+   */
+  function own(table, key) {
+    return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+  }
+
   // ---------------------------------------------------------------------------
   // Language resolution
   // ---------------------------------------------------------------------------
@@ -865,8 +876,8 @@
   function normalize(tag) {
     if (typeof tag !== 'string') return null;
     var primary = tag.trim().toLowerCase().split(/[-_]/)[0];
-    primary = ALIASES[primary] || primary;
-    return STRINGS[primary] ? primary : null;
+    primary = own(ALIASES, primary) || primary;
+    return own(STRINGS, primary) ? primary : null;
   }
 
   /**
@@ -909,8 +920,12 @@
 
   /** Language reported by the hosting platform's user profile (Telegram, CrazyGames). */
   function sdkLang() {
-    var user = G.sdk && G.sdk.user;
-    return user ? user.lang : null;
+    try {
+      var user = G.sdk && G.sdk.user;
+      return user ? user.lang : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   /**
@@ -932,7 +947,7 @@
    * @returns {'rtl'|'ltr'}
    */
   function dir(code) {
-    return RTL[code || current] ? 'rtl' : 'ltr';
+    return own(RTL, code || current) ? 'rtl' : 'ltr';
   }
 
   /** Reflect the current language on <html lang dir> so CSS and screen readers follow. */
@@ -950,26 +965,46 @@
     try { storage.set(STORAGE_KEY, code); } catch (e) { G.log('[i18n] persist failed', e); }
   }
 
+  /**
+   * Build the 'g:lang' event. Older WebViews expose CustomEvent as an object
+   * rather than a constructor, so fall back to document.createEvent there.
+   * @param {{lang: string, dir: string}} detail
+   * @returns {Event|null}
+   */
+  function createLangEvent(detail) {
+    if (typeof window.CustomEvent === 'function') {
+      return new window.CustomEvent('g:lang', { detail: detail });
+    }
+    var doc = window.document;
+    if (!doc || typeof doc.createEvent !== 'function') return null;
+    var legacy = doc.createEvent('CustomEvent');
+    legacy.initCustomEvent('g:lang', false, false, detail);
+    return legacy;
+  }
+
   /** Notify the rest of the game that strings changed. */
   function emitChange() {
-    if (typeof window.CustomEvent !== 'function' || typeof window.dispatchEvent !== 'function') return;
+    if (typeof window.dispatchEvent !== 'function') return;
     try {
-      window.dispatchEvent(new window.CustomEvent('g:lang', { detail: { lang: current, dir: dir(current) } }));
+      var event = createLangEvent({ lang: current, dir: dir(current) });
+      if (event) window.dispatchEvent(event);
     } catch (e) {
       G.log('[i18n] event dispatch failed', e);
     }
   }
 
   /**
-   * Choose the active language. Precedence, first hit wins:
+   * Choose the active language. Candidates are tried in order and the first one
+   * that maps to a supported language wins (an unsupported `?lang=xx` therefore
+   * falls through to the next source instead of straight to the default):
    *   opts.lang → URL ?lang= → saved choice (G.storage 'lang') → G.sdk.user.lang → navigator.languages → 'en'.
    * Also sets <html lang> and <html dir>. Safe to call more than once.
    * @param {{lang?: string}} [opts]
    * @returns {string} the chosen language code
    */
   function init(opts) {
-    var wanted = (opts && opts.lang) || urlLang() || storedLang() || sdkLang();
-    current = normalize(wanted) || detect();
+    var candidates = [opts && opts.lang, urlLang(), storedLang(), sdkLang()];
+    current = firstSupported(candidates) || detect();
     applyToDocument();
     G.log('[i18n] init →', current);
     return current;
@@ -1013,20 +1048,31 @@
   }
 
   /**
+   * String for `key` in `table`, or undefined. Only own string values count, so a
+   * key like 'constructor' never leaks an Object.prototype member into the UI.
+   * @param {Object<string, string>} table
+   * @param {*} key
+   * @returns {string|undefined}
+   */
+  function lookup(table, key) {
+    var text = own(table, key);
+    return typeof text === 'string' ? text : undefined;
+  }
+
+  /**
    * Translate a key in the current language, falling back to English, then to the key itself.
    * @param {string} key
    * @param {Object<string, *>} [vars] values for `{name}` placeholders
    * @returns {string}
    */
   function t(key, vars) {
-    var table = STRINGS[current] || STRINGS[DEFAULT_LANG];
-    var text = table[key];
-    if (text === undefined) text = STRINGS[DEFAULT_LANG][key];
+    var text = lookup(STRINGS[current], key);
+    if (text === undefined) text = lookup(STRINGS[DEFAULT_LANG], key);
     if (text === undefined) {
       G.log('[i18n] missing key:', key);
       return String(key);
     }
-    return vars ? interpolate(text, vars) : text;
+    return vars && typeof vars === 'object' ? interpolate(text, vars) : text;
   }
 
   /**
@@ -1035,7 +1081,7 @@
    * @returns {boolean}
    */
   function has(key) {
-    return Object.prototype.hasOwnProperty.call(STRINGS[DEFAULT_LANG], key);
+    return lookup(STRINGS[DEFAULT_LANG], key) !== undefined;
   }
 
   /**
@@ -1044,29 +1090,35 @@
    * @returns {string} e.g. 'Türkçe'; falls back to the code itself
    */
   function nativeName(code) {
-    return NATIVE_NAMES[code] || String(code);
+    return lookup(NATIVE_NAMES, code) || String(code);
   }
 
-  /** Plain thousands grouping used when Intl is unavailable. */
+  /**
+   * Plain thousands grouping used when Intl is unavailable. Values at or above
+   * 1e21 would stringify in exponent form, so those go through BigInt when present.
+   * @param {number} n integer
+   * @returns {string}
+   */
   function groupFallback(n) {
     var sign = n < 0 ? '-' : '';
-    var digits = String(Math.abs(n));
+    var abs = Math.abs(n);
+    var digits = abs >= 1e21 && typeof BigInt === 'function' ? BigInt(abs).toString() : String(abs);
     return sign + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
   }
 
   /**
    * Format an integer with locale grouping (score counters, coin balances).
-   * Non-finite input yields '0'; fractions are rounded.
+   * Non-finite input yields '0'; fractions are rounded; -0 prints as '0'.
    * @param {number} n
    * @returns {string}
    */
   function fmtNumber(n) {
     var value = Math.round(Number(n));
-    if (!isFinite(value)) value = 0;
+    if (!isFinite(value) || value === 0) value = 0;
     var formatter = formatters[current];
     if (formatter === undefined) {
       try {
-        formatter = new Intl.NumberFormat(LOCALES[current] || current, { maximumFractionDigits: 0 });
+        formatter = new Intl.NumberFormat(own(LOCALES, current) || current, { maximumFractionDigits: 0 });
       } catch (e) {
         formatter = null;
       }
