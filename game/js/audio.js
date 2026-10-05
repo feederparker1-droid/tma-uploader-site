@@ -25,6 +25,8 @@
  *   - Settings (sfx / music / volume) persist through G.storage when present and
  *     follow external changes (cloud mirror pulls, imports) via 'g:storage'.
  *   - renderSfx() renders any SFX through an OfflineAudioContext for QA/tests.
+ *   - ctx() / buses() expose the live context and master-chain buses so layered
+ *     modules (G.gameAudio) can add their own voices without a second context.
  *
  * Classic script (IIFE), no dependencies, works from file://.
  */
@@ -1365,6 +1367,19 @@
     testTone: testTone,
     renderSfx: renderSfx,
     music: music,
+    /** @returns {AudioContext|null} the live context, once unlock() has created it. */
+    ctx: function () {
+      return rig ? rig.ctx : null;
+    },
+    /**
+     * Master-chain buses for layered modules. `reverbSend` is null: this chain
+     * has no shared reverb. `musicFilter` is the music bus lowpass (the one
+     * music.setIntensity() drives) so a death "slam" can reach it.
+     * @returns {{sfx:GainNode, music:GainNode, reverbSend:null, master:GainNode, musicFilter:BiquadFilterNode}|null}
+     */
+    buses: function () {
+      return rig ? { sfx: rig.sfxBus, music: rig.musicBus, reverbSend: null, master: rig.master, musicFilter: rig.musicFilter } : null;
+    },
     /** Live state snapshot (read-only by convention). */
     state: state,
     /** All SFX names. */
