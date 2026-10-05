@@ -10,10 +10,17 @@
  *
  * TUNING LOG (mandatory gate of the design, tests/sim.test.mjs "tuning gate"):
  *   The only rows that may change after the physics lock are DIFFICULTY gap/lat/hot.
- *   Final measured values with the table below (20 perfect-bot seeds, 60 clumsy-bot seeds):
- *     perfect bot: 20/20 seeds reached 3000 m (floor required: 20/20)
- *     clumsy bot : median death 48.8 s (required 20–70 s), p25 32.5 s, p75 71.4 s
- *   gap/lat/hot are therefore the design values, untouched.
+ *   Measured with the table below (node tests/sim.test.mjs), after the review fix of
+ *   the bot planner (latch plans only consider release angles ahead of the latch point):
+ *     perfect bot : 20/20 seeds (1..20) reached 3000 m alive — floor MET
+ *                   (seeds 21..40, robustness line: 20/20; seeds 1..10 to 6000 m: 8/10, both FELL)
+ *     clumsy bot  : median death 11.7 s over 40 seeds (p25 7.1 s, p75 18.2 s, max 148 s;
+ *                   28 crashed on the rod after an emergency latch, 9 fell, 3 crashed in flight),
+ *                   design band 20–70 s NOT MET. The median is insensitive to the
+ *                   sanctioned knobs: gap −30 px → 9.7 s, gap +40 px → 9.3 s, lat −80 px → 14.2 s,
+ *                   hot = 0 everywhere → unchanged. It is set by the prescribed ±25° aim noise
+ *                   (±15° → 15.2 s, ±10° → 39 s, 0° → 161 s, same table), so the table keeps
+ *                   the design values; retuning gap/lat/hot cannot move this gate.
  */
 (function () {
   'use strict';
@@ -72,7 +79,7 @@
     // --- difficulty table: rows by altitude A (m) at the chunk base ---------------
     // R: planet radius range (px); gap: vertical hop range (px); lat: max lateral hop (px);
     // hot: probability of a hot planet; drift: probability of a drifting planet (applied from 700 m).
-    // Measured tuning gate (see header): design values pass unchanged.
+    // Measured tuning gate (see header): design values kept unchanged.
     DIFFICULTY: [
       { from: 0,    R: [44, 72], gap: [170, 230], lat: 140, hot: 0.00, drift: 0.00 },
       { from: 200,  R: [36, 64], gap: [200, 280], lat: 180, hot: 0.00, drift: 0.00 },

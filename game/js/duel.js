@@ -16,11 +16,14 @@
  *           payload would exceed CONFIG.SHARE.PAYLOAD_MAX characters.
  *
  * Hop record (5 bytes, one per latch→release):
- *   [0] planet ordinal delta  u8   delta of ordinalOf(planetId) from the previous
- *                                  hop (first hop: from ordinal 0 = planet 0);
- *                                  0 = same planet re-latched. Clamped to 0..255:
- *                                  a backward latch (negative delta, rare) is
- *                                  therefore drawn on the previous planet.
+ *   [0] planet ordinal delta  u8   zigzag(delta of ordinalOf(planetId) from the
+ *                                  previous hop; first hop: from ordinal 0 =
+ *                                  planet 0). 0 = same planet re-latched, 1 = −1,
+ *                                  2 = +1, 3 = −2, … range −128..+127. The delta
+ *                                  is SIGNED because the generator appends
+ *                                  satellites after the main chain, so a
+ *                                  satellite → next-main latch moves backwards
+ *                                  in id order; real deltas stay within ±32.
  *   [1] latch angle           u8   theta quantised to 2π/256
  *   [2] latch radius 7 bits        r / 2.5 px, 0..127 (≤ 317.5 px)
  *       | 0x80                     'rewound here' flag
@@ -30,6 +33,7 @@
  *
  * Planet ordinals: planet ids are k*1000 + idx (idx < 32 per chunk), so
  * ordinalOf(id) = k*32 + idx keeps consecutive deltas small across chunks.
+ * A flight cannot cross a whole 2000 px chunk, so |delta| ≤ 32 < 128.
  *
  * PURE: everything except readFromLocation() / buildLinks() / shareText() is
  * deterministic and touches no DOM, clock or randomness. Those three read
@@ -68,6 +72,9 @@
   var ORDINALS_PER_CHUNK = 32;
   /** Planet ids are k*1000 + idx. */
   var IDS_PER_CHUNK = 1000;
+  /** Signed ordinal delta range representable by the zigzag byte. */
+  var DELTA_MIN = -128;
+  var DELTA_MAX = 127;
   /** Latch radius quantisation step (px). */
   var RADIUS_STEP = 2.5;
   /** Hard ceilings for tolerant numeric parsing. */
@@ -157,6 +164,18 @@
   /** Byte → angle in radians, [0, 2π). */
   function dequantAngle(byte) {
     return (byte & 255) / 256 * TWO_PI;
+  }
+
+  /** Signed delta (−128..127) → zigzag byte (0, 1, 2, 3, … = 0, −1, +1, −2, …). */
+  function zigzag(delta) {
+    var d = clamp(Math.round(Number(delta) || 0), DELTA_MIN, DELTA_MAX);
+    return d >= 0 ? d * 2 : -d * 2 - 1;
+  }
+
+  /** Zigzag byte → signed delta. */
+  function unzigzag(byte) {
+    var b = byte & 255;
+    return (b & 1) ? -((b + 1) >>> 1) : b >>> 1;
   }
 
   /**
@@ -275,7 +294,7 @@
   function writeRecord(out, offset, hop) {
     var radiusQ = clamp(Math.round(hop.r / RADIUS_STEP), 0, 127);
     var heatQ = clamp(Math.round(hop.heat * 127), 0, 127);
-    out[offset] = clamp(hop.dPlanet, 0, 255);
+    out[offset] = zigzag(hop.dPlanet);
     out[offset + 1] = quantAngle(hop.latchTheta);
     out[offset + 2] = radiusQ | (hop.rewound ? 0x80 : 0);
     out[offset + 3] = quantAngle(hop.releaseTheta);
@@ -293,7 +312,7 @@
     for (var i = 0; i < count; i++) {
       var o = i * RECORD_BYTES;
       hops.push({
-        dPlanet: bytes[o],
+        dPlanet: unzigzag(bytes[o]),
         latchAngle: dequantAngle(bytes[o + 1]),
         r: (bytes[o + 2] & 0x7F) * RADIUS_STEP,
         rewound: (bytes[o + 2] & 0x80) !== 0,
@@ -333,7 +352,7 @@
     function open(latch, rewound) {
       var ordinal = ordinalOf(latch.planetId);
       pending = {
-        dPlanet: clamp(ordinal - prevOrdinal, 0, 255),
+        dPlanet: clamp(ordinal - prevOrdinal, DELTA_MIN, DELTA_MAX),
         ordinal: ordinal,
         latchTheta: Number(latch.theta) || 0,
         r: isFiniteNumber(latch.r) ? latch.r : 0,
@@ -510,7 +529,10 @@
     }
   }
 
-  /** Telegram's raw start_param: initDataUnsafe first, then the tgWebAppStartParam hash key. */
+  /**
+   * Telegram's raw start_param: initDataUnsafe first, then the tgWebAppStartParam
+   * key, which Telegram clients put in the hash fragment (some in the query string).
+   */
   function telegramStartParam() {
     var raw = null;
     try {
@@ -523,14 +545,16 @@
         raw = new URLSearchParams((window.location.hash || '').replace(/^#/, '')).get('tgWebAppStartParam');
       } catch (err) { raw = null; }
     }
+    if (!raw) raw = queryParam('tgWebAppStartParam');
     return raw || null;
   }
 
   /**
    * Finds a duel payload or daily key in the launch context, in this order:
    * location.hash '#d…', query ?d=YYYYMMDD (or ?d=payload), G.sdk.getParam('d'),
-   * G.sdk.getParam('startapp'), the raw Telegram start_param (whole value =
-   * payload, or 'k1-v1' style with key 'd' / 'startapp').
+   * G.sdk.getParam('startapp'), the raw Telegram start_param (initDataUnsafe or
+   * tgWebAppStartParam in the hash / query; whole value = payload, or 'k1-v1'
+   * style with key 'd' / 'startapp').
    * @returns {{kind:'duel', decoded:object}|{kind:'daily', dateKey:string}|null}
    */
   function readFromLocation() {
@@ -632,6 +656,19 @@
     return from - (delta === 0 ? 0 : TWO_PI - delta);
   }
 
+  /**
+   * True when hop `next` is the rewind re-open of hop `prev`'s own latch: the
+   * player died during prev's flight, REWIND put the comet back on the same
+   * tether, and the recorder re-opened that latch flagged 'rewound'. prev's
+   * flight therefore did not lead to next's latch point and must not be joined
+   * to it. (A rewind after dying while tethered flags the hop itself instead;
+   * that hop's own latch WAS reached by the previous flight.)
+   */
+  function isRewindOfSameLatch(prev, next) {
+    return !!next && next.rewound && next.planetId === prev.planetId &&
+      next.r === prev.r && next.s === prev.s && next.from === prev.from;
+  }
+
   /** Integrates one ghost flight; returns sample points (world coords). */
   function flight(x0, y0, vx, vy, phys, nextLatch) {
     var pts = [[x0, y0]];
@@ -667,8 +704,11 @@
    * the flight (speed V_ORBIT*(1+HOT_BOOST*heat), gravity GRAVITY, wall bounces)
    * for ≤ 1.5 s or, when a next hop exists, cut at the sample nearest to its
    * latch point and joined to that point (the curve's last point IS the next
-   * latch point, so the renderer needs no separate join). Hops whose planet the
-   * lookup does not know are skipped. Every coordinate is finite.
+   * latch point, so the renderer needs no separate join). A flight the player
+   * died in and rewound out of (the next hop re-opens the same latch, flagged
+   * rewound) runs the full 1.5 s unjoined instead. Hops whose planet the lookup
+   * does not know are skipped; malformed hop entries are ignored. Every
+   * coordinate is finite.
    *
    * @param {{path:Array}} decoded result of decode()
    * @param {function(number):({x0:number, y:number, R?:number}|null|undefined)} lookupPlanet
@@ -685,7 +725,9 @@
     var ordinal = 0;
     for (var i = 0; i < hops.length; i++) {
       var hop = hops[i];
-      ordinal += toNonNegInt(hop.dPlanet, 255);
+      if (!hop || typeof hop !== 'object') continue;
+      var dPlanet = Number(hop.dPlanet);
+      ordinal = Math.max(0, ordinal + (isFinite(dPlanet) ? clamp(Math.round(dPlanet), DELTA_MIN, DELTA_MAX) : 0));
       var id = idFromOrdinal(ordinal);
       var planet = safeCall(lookupPlanet, null, [id]);
       if (!planet || !isFiniteNumber(planet.x0) || !isFiniteNumber(planet.y)) continue;
@@ -703,6 +745,7 @@
     for (var j = 0; j < resolved.length; j++) {
       var h = resolved[j];
       var next = resolved[j + 1] || null;
+      if (isRewindOfSameLatch(h, next)) next = null;
       out.push({ type: 'arc', cx: h.cx, cy: h.cy, r: h.r, from: h.from, to: h.to, s: h.s, rewound: h.rewound, planetId: h.planetId });
       var speed = phys.V_ORBIT * (1 + phys.HOT_BOOST * h.heat);
       var x0 = h.cx + h.r * Math.cos(h.to);

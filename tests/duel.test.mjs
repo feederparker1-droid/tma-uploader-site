@@ -17,6 +17,8 @@ import { chromium } from '/opt/node-tools/node_modules/playwright/index.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DUEL_PATH = path.resolve(here, '../game/js/duel.js');
 const I18N_PATH = path.resolve(here, '../game/js/i18n.js');
+const CONFIG_PATH = path.resolve(here, '../game/js/config.js');
+const SIM_PATH = path.resolve(here, '../game/js/sim.js');
 const duelSource = fs.readFileSync(DUEL_PATH, 'utf8');
 const i18nSource = fs.readFileSync(I18N_PATH, 'utf8');
 
@@ -64,7 +66,8 @@ function mulberry32(seed) {
 
 /**
  * Load duel.js (and optionally i18n.js) into a fresh sandbox.
- * @param {{hash?:string, search?:string, href?:string, sdk?:object, telegram?:object, config?:object, withI18n?:boolean, G?:object}} [env]
+ * @param {{hash?:string, search?:string, href?:string, sdk?:object, telegram?:object, config?:object, withI18n?:boolean, withSim?:boolean, G?:object}} [env]
+ *   `withSim` loads the real config.js + sim.js first (G.CONFIG then comes from config.js).
  */
 function load(env = {}) {
   const logs = [];
@@ -73,6 +76,8 @@ function load(env = {}) {
     Intl,
     URLSearchParams,
     Uint8Array,
+    Map,
+    Set,
     location: {
       hash: env.hash ?? '',
       search: env.search ?? '',
@@ -88,6 +93,10 @@ function load(env = {}) {
   sandbox.G = { ...(env.G ?? {}) };
   if (env.sdk) sandbox.G.sdk = env.sdk;
   if (env.config !== undefined) sandbox.G.CONFIG = env.config;
+  if (env.withSim) {
+    vm.runInNewContext(fs.readFileSync(CONFIG_PATH, 'utf8'), sandbox, { filename: 'config.js' });
+    vm.runInNewContext(fs.readFileSync(SIM_PATH, 'utf8'), sandbox, { filename: 'sim.js' });
+  }
   if (env.withI18n) vm.runInNewContext(i18nSource, sandbox, { filename: 'i18n.js' });
   vm.runInNewContext(duelSource, sandbox, { filename: 'duel.js' });
   return { G: sandbox.G, duel: sandbox.G.duel, logs, sandbox };
@@ -98,12 +107,15 @@ function plain(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-/** Random hops as a walk along the generation order (delta 0..6 per hop, like a real run). */
+/**
+ * Random hops as a walk along the generation order: mostly forward (delta 0..6),
+ * sometimes backward (−1..−3, like a satellite → next-main latch), never below 0.
+ */
 function randomHops(duelApi, rng, count) {
   const hops = [];
   let ordinal = 0;
   for (let i = 0; i < count; i++) {
-    ordinal += Math.floor(rng() * 7);
+    ordinal = Math.max(0, ordinal + (rng() < 0.25 ? -1 - Math.floor(rng() * 3) : Math.floor(rng() * 7)));
     hops.push({
       planetId: duelApi.idFromOrdinal(ordinal),
       theta: rng() * 4 * Math.PI - 2 * Math.PI,
@@ -191,6 +203,21 @@ test('base64url matches Buffer for 0..64 byte vectors and random data', () => {
   assert.deepEqual(Array.from(duel.base64urlDecode('')), []);
 });
 
+test('zigzag planet delta byte: 0 = same planet, odd = backward, even = forward, ±127/−128 clamp', () => {
+  const byte0 = (planetIds) => {
+    const rec = duel.createRecorder();
+    for (const id of planetIds) { rec.onLatch({ planetId: id, theta: 0, r: 50, s: 1 }); rec.onRelease({ theta: 0, heat: 0 }); }
+    return Array.from(rec.toBytes()).filter((_, i) => i % 5 === 0);
+  };
+  assert.deepEqual(byte0([0, 0, 1, 0, 3, 1]), [0, 0, 2, 1, 6, 3]); // 0, 0, +1, −1, +3, −2
+  assert.deepEqual(byte0([duel.idFromOrdinal(127)]), [254]);
+  assert.deepEqual(byte0([duel.idFromOrdinal(130)]), [254], 'forward clamps to +127');
+  assert.deepEqual(byte0([duel.idFromOrdinal(130), 0]), [254, 255], 'backward clamps to −128');
+  // decode reproduces the signed deltas
+  const dec = duel.decode('d1_1_1_A_' + Buffer.from([0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 255, 0, 0, 0, 0, 254, 0, 0, 0, 0]).toString('base64url'));
+  assert.deepEqual(plain(dec.path.map((h) => h.dPlanet)), [0, -1, 1, -128, 127]);
+});
+
 test('recorder: 5 bytes per hop, hops count, first hop delta is the absolute ordinal', () => {
   const rec = duel.createRecorder();
   assert.equal(rec.hops, 0);
@@ -202,8 +229,8 @@ test('recorder: 5 bytes per hop, hops count, first hop delta is the absolute ord
   assert.equal(rec.hops, 2);
   const bytes = rec.toBytes();
   assert.equal(bytes.length, 10);
-  assert.deepEqual(Array.from(bytes.slice(0, 5)), [3, 64, 40, 128, 64 | 0x80]);
-  assert.deepEqual(Array.from(bytes.slice(5, 10)), [34 - 3, 0, 100, 192, 127]);
+  assert.deepEqual(Array.from(bytes.slice(0, 5)), [3 * 2, 64, 40, 128, 64 | 0x80]);
+  assert.deepEqual(Array.from(bytes.slice(5, 10)), [(34 - 3) * 2, 0, 100, 192, 127]);
   assert.equal(rec.toBase64Url(), Buffer.from(bytes).toString('base64url'));
 });
 
@@ -221,7 +248,7 @@ test('recorder: title-orbit release without a latch records the start orbit (pla
   const rec2 = duel.createRecorder({ start: { planetId: 2, theta: 0, r: 80, s: -1 } });
   rec2.onRelease({ theta: 1, heat: 0 });
   const b = rec2.toBytes();
-  assert.equal(b[0], 2);
+  assert.equal(b[0], 2 * 2);
   assert.equal(b[2], 32);
   assert.equal(b[4] & 0x80, 0);
 });
@@ -250,7 +277,7 @@ test('recorder: markRewound flags the pending hop, or re-opens the last latch wi
   assert.equal(bytes[9] & 0x80, 0, 'direction copied from the latch');
 });
 
-test('recorder: planet deltas clamp to 0..255 (backward latch → 0, huge jump → 255) and hops cap at 300', () => {
+test('recorder: planet deltas are signed (backward latch → −2, huge jump → +127) and hops cap at 300', () => {
   const rec = duel.createRecorder();
   rec.onLatch({ planetId: 2005, theta: 0, r: 50, s: 1 });
   rec.onRelease({ theta: 1, heat: 0 });
@@ -259,9 +286,11 @@ test('recorder: planet deltas clamp to 0..255 (backward latch → 0, huge jump �
   rec.onLatch({ planetId: 90000, theta: 0, r: 50, s: 1 }); // far ahead
   rec.onRelease({ theta: 1, heat: 0 });
   const bytes = rec.toBytes();
-  assert.equal(bytes[0], 2 * 32 + 5);
-  assert.equal(bytes[5], 0);
-  assert.equal(bytes[10], 255);
+  assert.equal(bytes[0], (2 * 32 + 5) * 2);
+  assert.equal(bytes[5], 3, 'zigzag(−2)');
+  assert.equal(bytes[10], 254, 'zigzag(+127)');
+  const back = duel.decode(duel.encode({ seed: 1, score: 1, altM: 1, name: 'A', path: bytes })).path.map((h) => h.dPlanet);
+  assert.deepEqual(plain(back), [69, -2, 127]);
   for (let i = 0; i < 400; i++) {
     rec.onLatch({ planetId: i, theta: 0, r: 50, s: 1 });
     rec.onRelease({ theta: 0, heat: 0 });
@@ -314,8 +343,10 @@ test('encode/decode roundtrip for random payloads including 300 hops (PAYLOAD_MA
     assert.equal(d.hasPath, hopCount > 0);
     assert.equal(d.path.length, hopCount);
     let ordinal = 0;
+    let sawBackward = false;
     sorted.forEach((h, i) => {
       const got = d.path[i];
+      if (got.dPlanet < 0) sawBackward = true;
       ordinal += got.dPlanet;
       assert.equal(wide.idFromOrdinal(ordinal), h.planetId, `planet ${i}`);
       assert.ok(angDiff(got.latchAngle, h.theta) <= Math.PI / 256 + 1e-9, `latch angle ${i}`);
@@ -325,8 +356,36 @@ test('encode/decode roundtrip for random payloads including 300 hops (PAYLOAD_MA
       assert.equal(got.s, h.s, `dir ${i}`);
       assert.equal(got.rewound, false);
     });
-    if (hopCount === 300) assert.ok(payload.length > 1500, '300 hops exceed the default cap');
+    if (hopCount === 300) {
+      assert.ok(payload.length > 1500, '300 hops exceed the default cap');
+      assert.ok(sawBackward, 'the 300-hop walk exercises backward deltas');
+    }
   }
+});
+
+test('decode fuzz: 3000 random strings never throw and every result is well-formed', () => {
+  const rng = mulberry32(31337);
+  const alphabet = 'd_0123456789abcxyzABC-+/=#% .\u0000\u2028';
+  let decoded = 0;
+  for (let i = 0; i < 3000; i++) {
+    let str = i % 3 === 0 ? 'd' + Math.floor(rng() * 1e6).toString(36) + '_' + Math.floor(rng() * 1e4) + '_' + Math.floor(rng() * 1e4) + '_' : '';
+    const n = Math.floor(rng() * 40);
+    for (let j = 0; j < n; j++) str += alphabet[Math.floor(rng() * alphabet.length)];
+    const out = duel.decode(str);
+    if (!out) continue;
+    decoded++;
+    for (const k of ['seed', 'score', 'altM']) assert.ok(Number.isInteger(out[k]) && out[k] >= 0, `${k} in ${str}`);
+    assert.ok(out.seed <= 0xFFFFFFFF);
+    assert.match(out.name, /^[A-Za-z0-9]{1,12}$/);
+    assert.equal(out.hasPath, out.path.length > 0);
+    for (const h of out.path) {
+      assert.ok(Number.isInteger(h.dPlanet) && h.dPlanet >= -128 && h.dPlanet <= 127);
+      assert.ok(h.latchAngle >= 0 && h.latchAngle < TWO_PI && h.releaseAngle >= 0 && h.releaseAngle < TWO_PI);
+      assert.ok(h.r >= 0 && h.r <= 317.5 && h.heat >= 0 && h.heat <= 1 && (h.s === 1 || h.s === -1));
+      assert.equal(typeof h.rewound, 'boolean');
+    }
+  }
+  assert.ok(decoded > 50, `fuzz produced some valid payloads (${decoded})`);
 });
 
 test('truncation at PAYLOAD_MAX drops only the path; shorter paths survive', () => {
@@ -382,7 +441,8 @@ test('decode: tolerant on numerics and bad paths, null on garbage / overlong', (
   const bytes = Uint8Array.from({ length: 60 }, (_, i) => (i * 97 + 251) & 255);
   const p = 'd1_5_6_A_' + Buffer.from(bytes).toString('base64url');
   assert.ok(/[-_]/.test(p.slice(10)), 'vector exercises both url chars');
-  assert.deepEqual(Array.from(duel.decode(p).path.map((h) => h.dPlanet)), Array.from(bytes.filter((_, i) => i % 5 === 0)));
+  const unzigzag = (b) => ((b & 1) ? -((b + 1) >>> 1) : b >>> 1);
+  assert.deepEqual(Array.from(duel.decode(p).path.map((h) => h.dPlanet)), Array.from(bytes.filter((_, i) => i % 5 === 0), unzigzag));
   // garbage
   for (const bad of ['', 'd', 'x1_1_1_A', 'd1_1_1', 'd_1_1_A', 'd1_a_1_A', 'd1_1_b_A', 'd1_-1_1_A', 'd1_1.5_1_A',
     'dzzzzzzzz_1_1_A', 'd' + (2 ** 32).toString(36) + '_1_1_A', 'd1__1_A', 20260105, null, undefined, {}, 'd1_1_1_A'.padEnd(9000, 'A')]) {
@@ -448,6 +508,10 @@ test('readFromLocation: raw Telegram start_param (whole payload, k1-v1 style, tg
   r = load({ config: CONFIG, hash: '#tgWebAppData=x&tgWebAppStartParam=' + payload + '&tgWebAppVersion=7' }).duel.readFromLocation();
   assert.equal(r.kind, 'duel');
   assert.equal(r.decoded.name, 'Raw');
+  // some clients pass tgWebAppStartParam in the query string
+  r = load({ config: CONFIG, search: '?tgWebAppStartParam=' + payload }).duel.readFromLocation();
+  assert.equal(r.kind, 'duel');
+  assert.equal(r.decoded.seed, 11);
   // garbage start_param
   assert.equal(load({ config: CONFIG, telegram: tg('hello') }).duel.readFromLocation(), null);
 });
@@ -585,6 +649,91 @@ test('expandPath: unknown planets skipped, bad input tolerated, deterministic', 
   assert.deepEqual(plain(duel.expandPath(decoded, lookup)), plain(a));
   // a lookup that throws is treated as unknown
   assert.deepEqual(plain(duel.expandPath(decoded, () => { throw new Error('gen failed'); })), []);
+});
+
+test('expandPath: signed deltas walk backwards; the running ordinal never drops below 0; null entries ignored', () => {
+  const lookup = syntheticLookup();
+  const hop = (dPlanet) => ({ dPlanet, latchAngle: 0, r: 60, rewound: false, releaseAngle: 1, heat: 0.2, s: 1 });
+  const ghost = duel.expandPath({ path: [hop(5), null, hop(-3), 'junk', hop(-9), hop(1)] }, lookup);
+  assert.deepEqual(plain(ghost.filter((s) => s.type === 'arc').map((s) => s.planetId)), [5, 2, 0, 1]);
+});
+
+test('expandPath: a flight the player died in and rewound out of is not joined to the re-latch; a tethered-death rewind still joins', () => {
+  // death in flight after hop on planet 1 → REWIND → release again from the same latch
+  const a = duel.createRecorder();
+  a.onLatch({ planetId: 0, theta: 0, r: 100, s: 1 }); a.onRelease({ theta: 1, heat: 0 });
+  a.onLatch({ planetId: 1, theta: 0.5, r: 80, s: -1 }); a.onRelease({ theta: 2, heat: 0.3 });
+  a.markRewound();
+  a.onRelease({ theta: 2.5, heat: 0.6 });
+  a.onLatch({ planetId: 2, theta: 1, r: 70, s: 1 }); a.onRelease({ theta: 3, heat: 0 });
+  const ga = duel.expandPath(duel.decode(duel.encode({ seed: 1, score: 1, altM: 1, name: 'R', path: a.toBytes() })), syntheticLookup());
+  assert.equal(ga.length, 8);
+  assert.equal(ga[4].rewound, true);
+  assert.equal(ga[4].planetId, 1);
+  assert.equal(ga[3].pts.length, 1 + 1.5 * 30, 'fatal flight runs the full 1.5 s');
+  const endA = ga[3].pts[ga[3].pts.length - 1];
+  const latchA = [ga[4].cx + ga[4].r * Math.cos(ga[4].from), ga[4].cy + ga[4].r * Math.sin(ga[4].from)];
+  assert.ok(Math.hypot(endA[0] - latchA[0], endA[1] - latchA[1]) > 50, 'not joined to the re-latch point');
+  const endA2 = ga[5].pts[ga[5].pts.length - 1];
+  assert.ok(Math.abs(endA2[0] - (ga[6].cx + ga[6].r * Math.cos(ga[6].from))) < 1e-9, 'the rewound hop still joins the next latch');
+  // death while tethered on planet 1 → REWIND → release: the previous flight did lead to that latch
+  const b = duel.createRecorder();
+  b.onLatch({ planetId: 0, theta: 0, r: 100, s: 1 }); b.onRelease({ theta: 1, heat: 0 });
+  b.onLatch({ planetId: 1, theta: 0.5, r: 80, s: -1 });
+  b.markRewound();
+  b.onRelease({ theta: 2, heat: 0.3 });
+  const gb = duel.expandPath(duel.decode(duel.encode({ seed: 1, score: 1, altM: 1, name: 'R', path: b.toBytes() })), syntheticLookup());
+  assert.equal(gb.length, 4);
+  assert.equal(gb[2].rewound, true);
+  const endB = gb[1].pts[gb[1].pts.length - 1];
+  assert.ok(Math.abs(endB[0] - (gb[2].cx + gb[2].r * Math.cos(gb[2].from))) < 1e-9, 'joined');
+  assert.ok(Math.abs(endB[1] - (gb[2].cy + gb[2].r * Math.sin(gb[2].from))) < 1e-9, 'joined');
+});
+
+test('integration with the real sim: perfect-bot run → recorder → payload → ghost sits on the latched planets', () => {
+  const { G } = load({ withSim: true });
+  const { sim, duel: d } = G;
+  G.CONFIG.SHARE.PAYLOAD_MAX = 100000; // keep the full 60 s path for the comparison
+  for (const seed of [1, 2, 3]) {
+    const run = sim.createRun({ seed, mode: 'free' });
+    const rec = d.createRecorder();
+    const latches = [], releases = [];
+    while (run.state !== 'DEAD' && run.t < 60) {
+      const events = sim.step(run, sim.bots.perfect(run));
+      for (const e of events) {
+        if (e.type === 'LATCH') { rec.onLatch(e); latches.push(e); }
+        if (e.type === 'RELEASE') { rec.onRelease(e); releases.push(e); }
+      }
+      events.length = 0;
+    }
+    assert.ok(latches.length > 40, `bot made many hops (${latches.length})`);
+    const payload = d.encode({ seed, score: sim.scoreOf(run), altM: run.score.alt, name: 'Bot', path: rec.toBytes() });
+    const decoded = d.decode(payload);
+    assert.equal(decoded.path.length, releases.length, 'one record per release (title release included)');
+    const lookup = (id) => { const k = Math.floor(id / 1000); const chunk = run.chunks[k] || sim.gen(seed, k); return chunk.planets.find((p) => p.id === id) || null; };
+    const ghost = d.expandPath(decoded, lookup);
+    const arcs = ghost.filter((s) => s.type === 'arc');
+    // hop i is release i: hop 0 is the title release on planet 0; a tether still attached at the end is pending, not serialised
+    const released = latches.slice(0, releases.length - 1);
+    assert.deepEqual(plain(arcs.map((s) => s.planetId)), plain([0, ...released.map((l) => l.planetId)]), 'every arc on the planet that was latched');
+    assert.ok(decoded.path.some((h) => h.dPlanet < 0), 'the real run contains backward (satellite → main) deltas');
+    arcs.forEach((arc, i) => {
+      const planet = lookup(arc.planetId);
+      const tol = planet.drifting ? 90 : 6; // drift is ignored by contract (x0); otherwise quantisation only
+      const rel = releases[i];
+      assert.ok(Math.hypot(arc.cx + arc.r * Math.cos(arc.to) - rel.x, arc.cy + arc.r * Math.sin(arc.to) - rel.y) < tol, `release point ${i}`);
+      if (i > 0) {
+        const l = latches[i - 1];
+        assert.ok(Math.hypot(arc.cx + arc.r * Math.cos(arc.from) - l.x, arc.cy + arc.r * Math.sin(arc.from) - l.y) < tol, `latch point ${i}`);
+      }
+    });
+    // the production cap drops this long path but keeps the head intact
+    G.CONFIG.SHARE.PAYLOAD_MAX = 1500;
+    const capped = d.decode(d.encode({ seed, score: sim.scoreOf(run), altM: run.score.alt, name: 'Bot', path: rec.toBytes() }));
+    assert.equal(capped.altM, run.score.alt);
+    assert.equal(capped.hasPath, payload.length > 1500 ? false : true);
+    G.CONFIG.SHARE.PAYLOAD_MAX = 100000;
+  }
 });
 
 test('expandPath honours G.CONFIG physics when present', () => {

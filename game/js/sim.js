@@ -422,11 +422,17 @@
     run.planetList = list;
   }
 
-  /** Generates chunks up to camBottom + VIEW_H + GEN_AHEAD and releases those below camBottom - RELEASE_BELOW. */
+  /**
+   * Generates chunks up to camBottom + VIEW_H + GEN_AHEAD and releases those
+   * below camBottom - RELEASE_BELOW. A non-finite camera (only reachable through
+   * corrupted debug-panel values) leaves the loaded set untouched instead of
+   * looping forever.
+   */
   function ensureChunks(run) {
     var C = cfg();
     var kMax = Math.floor((run.camBottom + C.VIEW_H + GEN_AHEAD) / C.CHUNK_H);
     var kMin = Math.max(0, Math.floor((run.camBottom - RELEASE_BELOW) / C.CHUNK_H));
+    if (!isFinite(kMax) || !isFinite(kMin)) return;
     var changed = false;
     for (var k = kMin; k <= kMax; k++) {
       if (!run.chunks[k]) { addChunk(run, k); changed = true; }
@@ -590,18 +596,14 @@
   /* ------------------------------------------------------------------ */
 
   /**
-   * Target selection — the SAME function the latch uses (WYSIWYG reticle).
+   * Target selection for an arbitrary comet state {x, y, vx, vy} (see getTarget).
    * Candidates: planets with R + LATCH_MIN_CLEAR <= d <= tetherRange(A) and
    * dot(vhat, phat) >= TARGET_CONE_COS; the minimum of d + W*(1-dot)/2 wins.
    * Colour: 'red' when the orbit circle of radius d intersects another planet,
-   * else 'amber' when it crosses a wall, else 'green'. Null outside FLIGHT.
-   * @param {Object} run
-   * @returns {null|{planet:Object, d:number, color:('green'|'amber'|'red'), cx:number, cy:number}}
+   * else 'amber' when it crosses a wall, else 'green'.
    */
-  function getTarget(run) {
-    if (run.state !== STATES.FLIGHT) return null;
+  function selectTarget(run, c) {
     var C = cfg();
-    var c = run.comet;
     var speed = hypot(c.vx, c.vy);
     var vhx = 0, vhy = 1;
     if (speed > 1e-9) { vhx = c.vx / speed; vhy = c.vy / speed; }
@@ -628,6 +630,17 @@
     }
     if (color === 'green' && (bestCx - bestD < C.COMET_R || bestCx + bestD > C.COL_W - C.COMET_R)) color = 'amber';
     return { planet: best, d: bestD, color: color, cx: bestCx, cy: best.y };
+  }
+
+  /**
+   * Target selection — the SAME function the latch uses (WYSIWYG reticle).
+   * Null outside FLIGHT; otherwise selectTarget() for the current comet.
+   * @param {Object} run
+   * @returns {null|{planet:Object, d:number, color:('green'|'amber'|'red'), cx:number, cy:number}}
+   */
+  function getTarget(run) {
+    if (run.state !== STATES.FLIGHT) return null;
+    return selectTarget(run, run.comet);
   }
 
   /* ------------------------------------------------------------------ */
@@ -719,7 +732,7 @@
     c.vx = -T.s * speed * Math.sin(T.theta);
     c.vy = T.s * speed * Math.cos(T.theta);
     run.state = STATES.FLIGHT;
-    run.releaseInfo = { y: c.y, heat: run.heat };
+    run.releaseInfo = { y: c.y, heat: run.heat, planetId: T.planetId };
     run.lastReleaseY = c.y;
     var hotShot = !forced && run.heat >= C.HOT_SHOT_HEAT;
     emit(run, { type: 'RELEASE', heat: run.heat, hotShot: hotShot, theta: T.theta, x: c.x, y: c.y, speed: speed });
@@ -876,6 +889,9 @@
   /**
    * Rewind (rewarded): restores the snapshot taken at the last latch, keeps the
    * score (alt / banked / pool / M) as at death, heat = 0, state READY_ORBIT.
+   * ALT is "always safe", so maxY is never lowered: ALT === floor(maxY / 10)
+   * stays true after a rewind (the snapshot's maxY is only used when it is
+   * higher, which cannot happen in practice but keeps the field consistent).
    * Once per run and only from DEAD.
    * @param {Object} run
    * @returns {boolean} true when the rewind was applied
@@ -892,7 +908,7 @@
     run.t = snap.t;
     run.step = snap.step;
     run.camBottom = snap.camBottom;
-    run.maxY = snap.maxY;
+    run.maxY = Math.max(run.maxY, snap.maxY);
     run.heat = 0;
     run.state = STATES.READY_ORBIT;
     run.deathType = null;
@@ -913,14 +929,23 @@
   /* Bots (used by the tuning gate; deterministic given their inputs)      */
   /* ------------------------------------------------------------------ */
 
-  var ALIGN_RAD = 12 * Math.PI / 180; // release window around the aim direction
   var LOOP_R = 140;                    // loop when the rod is this short or shorter
-  var HEAT_SAFE = 0.85;                // planned heat at release must stay below this
+  var HEAT_SAFE = 0.75;                // planned heat at release must stay below this
   var HEAT_PANIC = 0.9;                // unconditional release
   var ARC_STEP = 0.05;                 // rad between collision samples along a planned arc
-  var ARC_PAD = 3;                     // px of extra clearance in arc checks
-  var AIM_OFFSET = 60;                 // flyby clearance above the planet radius when aiming (px)
+  var SCAN_STEP = 0.1;                 // rad between alignment samples when scanning a lap
+  var ARC_PAD = 8;                     // px of extra clearance in arc / path checks
+  var PLAN_PAD = 10;                   // extra px of path clearance demanded when planning (hysteresis)
+  var LATE_RAD = 45 * Math.PI / 180;   // release window after a blocked ideal release
+  var RELEASE_HORIZON = 0.45;          // s of ballistic lookahead for a release
   var CRASH_HORIZON = 0.3;             // s of ballistic lookahead for the emergency latch
+  var BALLISTIC_SUB = 3;               // sim steps per ballistic sample
+  var AIM_OFFSET = 60;                 // flyby clearance above the planet radius when aiming (px)
+  var HORIZON_PAD = 40;                // px a release point must stay above camBottom
+  var PARK_ARC = Math.PI / 2;          // rad of clear orbit a lenient 'park' latch requires
+  var AIM_REFINE = 8;                  // ternary-search refinements of the release angle
+  var ALIGN_RAD = 12 * Math.PI / 180;  // a local alignment within this is taken as the release point
+  var AIM_MAX_MIS = 30 * Math.PI / 180; // a plan whose best alignment is worse than this is rejected
 
   /** Lowest main planet strictly above planet p (null when none is loaded). */
   function nextMain(run, p) {
@@ -934,28 +959,214 @@
     return best;
   }
 
-  /** Signed difference a - b wrapped to [-pi, pi). */
-  function angleDiff(a, b) {
-    var d = a - b;
-    return d - TAU * Math.floor((d + Math.PI) / TAU);
+  /**
+   * Aim direction (rad) from (x, y) at time t toward the flyby point of N: the
+   * planet centre offset perpendicular to the line of sight by R + AIM_OFFSET on
+   * the side of the column centre, so the approach is never head-on and the
+   * resulting orbit is short enough to loop; raised by the gravity drop a shot
+   * of `speed` suffers on the way there. Straight up when N is null.
+   */
+  function aimAngle(run, t, x, y, N, noise, speed) {
+    if (!N) return Math.PI / 2 + noise;
+    var C = cfg();
+    var nx = planetX(N, t), ny = N.y;
+    var dx = nx - x, dy = ny - y;
+    var len = hypot(dx, dy) || 1;
+    var side = nx <= C.COL_W / 2 ? 1 : -1;
+    var off = (N.R + AIM_OFFSET) * side;
+    var fx = nx + (dy / len) * off;
+    var fy = ny - (dx / len) * off;
+    var ay = fy;
+    for (var it = 0; it < 2; it++) {
+      var tf = hypot(fx - x, ay - y) / speed;
+      ay = fy + 0.5 * C.GRAVITY * tf * tf;
+    }
+    return Math.atan2(ay - y, fx - x) + noise;
   }
 
   /**
-   * Aim direction (rad) from (x, y) toward the flyby point of N: the planet centre
-   * offset perpendicular to the line of sight by R + AIM_OFFSET on the side of the
-   * column centre, so the approach is never head-on and the resulting orbit radius
-   * is short enough to loop. Straight up when N is null. `noise` is added.
+   * Release angle for an orbit around p (radius d, direction s) at theta0 now
+   * with heat `heat0` rising at `rate` per second: the first point, from
+   * LATE_RAD behind the comet to a lap ahead, where the tangent's misalignment
+   * with the aim at the next main planet (seen from that point, at the time the
+   * comet gets there, drift and launch speed included) has a local minimum
+   * within ALIGN_RAD; else the best alignment of the lap. Refined by ternary
+   * search; robust where a fixed-point iteration would oscillate. `forceUp`
+   * aims straight up instead of at the next main planet. `lateRad` is how far
+   * behind the comet the scan starts: LATE_RAD on the rod (a release point just
+   * passed is still usable), 0 when planning a latch (nothing behind the latch
+   * point is reachable, so the plan is judged on the arc ahead only).
+   * @returns {{thetaR:number, delta:number, mis:number}} delta = arc to travel (negative when just passed), mis = residual misalignment (rad)
    */
-  function aimAngle(run, x, y, N, noise) {
-    if (!N) return Math.PI / 2 + noise;
-    var nx = planetX(N, run.t), ny = N.y;
-    var dx = nx - x, dy = ny - y;
-    var len = hypot(dx, dy) || 1;
-    var side = nx <= cfg().COL_W / 2 ? 1 : -1;
-    var off = (N.R + AIM_OFFSET) * side;
-    var ax = nx + (dy / len) * off;
-    var ay = ny - (dx / len) * off;
-    return Math.atan2(ay - y, ax - x) + noise;
+  function releaseAngle(run, p, d, s, theta0, heat0, rate, noise, forceUp, lateRad) {
+    var C = cfg();
+    var w = C.V_ORBIT / d;
+    var N = forceUp ? null : nextMain(run, p);
+    var late = lateRad === undefined ? LATE_RAD : lateRad;
+    var cy = p.y;
+    function misAt(phi) {
+      var tAt = run.t + Math.max(0, phi) / w;
+      var th = theta0 + s * phi;
+      var rx = planetX(p, tAt) + d * Math.cos(th), ry = cy + d * Math.sin(th);
+      var speed = C.V_ORBIT * (1 + C.HOT_BOOST * Math.min(1, heat0 + Math.max(0, phi) / w * rate));
+      return Math.abs(angleDiff(aimAngle(run, tAt, rx, ry, N, noise, speed), th + s * Math.PI / 2));
+    }
+    var bestPhi = 0, bestMis = Infinity;
+    var prev2 = Infinity, prev1 = misAt(-late - SCAN_STEP), found = NaN;
+    for (var phi = -late; phi < TAU; phi += SCAN_STEP) {
+      var m = misAt(phi);
+      if (m < bestMis) { bestMis = m; bestPhi = phi; }
+      if (prev1 <= ALIGN_RAD && prev1 < prev2 && prev1 <= m) { found = phi - SCAN_STEP; break; }
+      prev2 = prev1;
+      prev1 = m;
+    }
+    var centre = isNaN(found) ? bestPhi : found;
+    var lo = centre - SCAN_STEP, hi = centre + SCAN_STEP;
+    for (var it = 0; it < AIM_REFINE; it++) {
+      var m1 = lo + (hi - lo) / 3, m2 = hi - (hi - lo) / 3;
+      if (misAt(m1) < misAt(m2)) hi = m2; else lo = m1;
+    }
+    var delta = Math.max(-late, (lo + hi) / 2);
+    return { thetaR: theta0 + s * delta, delta: delta, mis: misAt(delta) };
+  }
+
+  /** Signed difference a - b wrapped to [-pi, pi). */
+  function angleDiff(a, b) {
+    var diff = a - b;
+    return diff - TAU * Math.floor((diff + Math.PI) / TAU);
+  }
+
+  /**
+   * True when a ballistic path from (x, y) at time t0 with velocity (vx, vy)
+   * dies within `horizon` seconds: hits a planet (with ARC_PAD + extraPad clearance) or
+   * falls under the camera horizon. Sampled every BALLISTIC_SUB sim steps
+   * (<= 16 px of travel per sample, well under any planet's padded radius).
+   */
+  function pathDeadly(run, t0, x, y, vx, vy, horizon, extraPad) {
+    var C = cfg();
+    var dt = BALLISTIC_SUB / C.SIM_HZ;
+    var list = run.planetList;
+    var steps = Math.ceil(horizon / dt);
+    var reach = Math.max(Math.abs(vx), Math.abs(vy) + C.GRAVITY * horizon) * horizon + 100;
+    var pad = C.COMET_R + ARC_PAD + (extraPad || 0);
+    var near = [];
+    for (var j = 0; j < list.length; j++) {
+      var q = list[j];
+      if (Math.abs(q.y - y) <= reach + q.R) near.push(q);
+    }
+    for (var i = 1; i <= steps; i++) {
+      vy -= C.GRAVITY * dt;
+      x += vx * dt;
+      y += vy * dt;
+      if (y + C.COMET_R < run.camBottom) return true;
+      var tAt = t0 + i * dt;
+      for (var k = 0; k < near.length; k++) {
+        var n = near[k];
+        if (hypot(planetX(n, tAt) - x, n.y - y) <= n.R + pad) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * True when the arc of the orbit circle around p (radius d) from theta0 over
+   * `arc` rad in direction s hits no wall or planet. Drifting planets (and the
+   * orbit centre itself) are evaluated at the time the comet reaches each
+   * sample: time advances by d / V_ORBIT per radian.
+   */
+  function arcClear(run, p, d, theta0, s, arc) {
+    var C = cfg();
+    var pad = C.COMET_R + ARC_PAD;
+    var wallLo = pad, wallHi = C.COL_W - pad;
+    var cy = p.y;
+    var cx = planetX(p, run.t);
+    var list = run.planetList;
+    var slack = pad + (p.drifting ? p.amp : 0);
+    var threats = [];
+    for (var i = 0; i < list.length; i++) {
+      var q = list[i];
+      if (q === p) continue;
+      var dc = hypot(q.x0 - p.x0, q.y - cy);
+      var qs = slack + (q.drifting ? q.amp : 0);
+      if (dc + q.R + qs >= d && dc - q.R - qs <= d) threats.push(q);
+    }
+    var needWall = (cx - d - slack < wallLo) || (cx + d + slack > wallHi);
+    if (!needWall && threats.length === 0) return true;
+    var secPerRad = d / C.V_ORBIT;
+    for (var phi = 0; phi <= arc; phi += ARC_STEP) {
+      var tAt = run.t + phi * secPerRad;
+      var th = theta0 + s * phi;
+      var x = planetX(p, tAt) + d * Math.cos(th), y = cy + d * Math.sin(th);
+      if (x < wallLo || x > wallHi) return false;
+      for (var j = 0; j < threats.length; j++) {
+        var tq = threats[j];
+        if (hypot(x - planetX(tq, tAt), y - tq.y) <= tq.R + pad) return false;
+      }
+    }
+    return true;
+  }
+
+  /** Orbit direction the sim would pick for comet state c around a planet centred at (cx, cy). */
+  function orbitDir(c, cx, cy) {
+    var cross = (c.x - cx) * c.vy - (c.y - cy) * c.vx;
+    return cross < 0 ? -1 : 1;
+  }
+
+  /**
+   * Plans a latch on planet p from comet state c ({x, y, vx, vy}): the release
+   * angle aimed at the next main planet, the heat budget, an optional loop, the
+   * arc up to the release and the flight after it. Null when not feasible; the
+   * optional `diag` object receives the name of the failing check in `reason`.
+   * @returns {null|{s:number, delta:number, loop:boolean, thetaR:number}}
+   */
+  function latchPlan(run, c, p, noise, diag) {
+    var C = cfg();
+    var cx = planetX(p, run.t), cy = p.y;
+    var d = hypot(c.x - cx, c.y - cy);
+    var theta0 = Math.atan2(c.y - cy, c.x - cx);
+    var s = orbitDir(c, cx, cy);
+    var w = C.V_ORBIT / d;
+    var rate = (p.hot ? 2 : 1) / C.T_BURN;
+    var ra = releaseAngle(run, p, d, s, theta0, run.heat, rate, noise, false, 0);
+    if (ra.mis > AIM_MAX_MIS) return fail(diag, 'aim');
+    var heatAtRelease = run.heat + (ra.delta / w) * rate;
+    if (heatAtRelease > HEAT_SAFE) return fail(diag, 'heat');
+    var loop = !p.hot && d <= LOOP_R && heatAtRelease + (TAU / w) * rate <= HEAT_SAFE;
+    var arc = loop ? ra.delta + TAU : ra.delta;
+    if (loop) heatAtRelease += (TAU / w) * rate;
+    var tRel = run.t + arc / w;
+    var relX = planetX(p, tRel) + d * Math.cos(ra.thetaR), relY = cy + d * Math.sin(ra.thetaR);
+    if (relY - C.COMET_R < run.camBottom + HORIZON_PAD) return fail(diag, 'horizon');
+    if (!arcClear(run, p, d, theta0, s, arc)) return fail(diag, 'arc');
+    var speed = C.V_ORBIT * (1 + C.HOT_BOOST * heatAtRelease);
+    if (pathDeadly(run, tRel, relX, relY, -s * speed * Math.sin(ra.thetaR), s * speed * Math.cos(ra.thetaR), RELEASE_HORIZON, PLAN_PAD)) return fail(diag, 'path');
+    return { s: s, delta: ra.delta, loop: loop, thetaR: ra.thetaR };
+  }
+
+  function fail(diag, reason) {
+    if (diag) diag.reason = reason;
+    return null;
+  }
+
+  /**
+   * Lenient "park" plan used when the comet is about to pass its target or is
+   * falling: `arc` rad of clear orbit, and a release (toward the next main
+   * planet, or straight up when none is reachable) within the heat budget. The
+   * flight after that release is not checked.
+   */
+  function parkPlan(run, c, p, arc) {
+    var C = cfg();
+    var cx = planetX(p, run.t), cy = p.y;
+    var d = hypot(c.x - cx, c.y - cy);
+    var theta0 = Math.atan2(c.y - cy, c.x - cx);
+    var s = orbitDir(c, cx, cy);
+    var w = C.V_ORBIT / d;
+    var rate = (p.hot ? 2 : 1) / C.T_BURN;
+    var ra = releaseAngle(run, p, d, s, theta0, run.heat, rate, 0, false, 0);
+    if (ra.mis > AIM_MAX_MIS) ra = releaseAngle(run, p, d, s, theta0, run.heat, rate, 0, true, 0);
+    var toRelease = Math.max(arc, ra.delta);
+    if (run.heat + (toRelease / w) * rate > HEAT_SAFE) return false;
+    return arcClear(run, p, d, theta0, s, arc);
   }
 
   /**
@@ -970,87 +1181,13 @@
     return { x: c.x + c.vx * dt, y: c.y + vy * dt, vx: c.vx, vy: vy };
   }
 
-  /** True when the ballistic path hits a planet within `horizon` seconds. */
-  function collisionImminent(run, horizon) {
-    var C = cfg();
-    var dt = 1 / C.SIM_HZ;
-    var x = run.comet.x, y = run.comet.y, vx = run.comet.vx, vy = run.comet.vy;
-    var list = run.planetList;
-    var steps = Math.ceil(horizon / dt);
-    for (var i = 0; i < steps; i++) {
-      vy -= C.GRAVITY * dt;
-      x += vx * dt;
-      y += vy * dt;
-      for (var j = 0; j < list.length; j++) {
-        var q = list[j];
-        if (hypot(planetX(q, run.t) - x, q.y - y) <= q.R + C.COMET_R) return true;
-      }
-    }
-    return false;
-  }
-
-  /** True when the arc of the orbit circle from theta0 over `arc` rad in direction s hits no wall or planet. */
-  function arcClear(run, p, cx, cy, d, theta0, s, arc) {
-    var C = cfg();
-    var pad = C.COMET_R + ARC_PAD;
-    var wallLo = pad, wallHi = C.COL_W - pad;
-    var list = run.planetList;
-    var threats = [];
-    for (var i = 0; i < list.length; i++) {
-      var q = list[i];
-      if (q === p) continue;
-      var qx = planetX(q, run.t);
-      var dc = hypot(qx - cx, q.y - cy);
-      if (dc + q.R + pad >= d && dc - q.R - pad <= d) threats.push({ x: qx, y: q.y, R: q.R });
-    }
-    var needWall = (cx - d < wallLo) || (cx + d > wallHi);
-    if (!needWall && threats.length === 0) return true;
-    for (var phi = 0; phi <= arc; phi += ARC_STEP) {
-      var th = theta0 + s * phi;
-      var x = cx + d * Math.cos(th), y = cy + d * Math.sin(th);
-      if (x < wallLo || x > wallHi) return false;
-      for (var j = 0; j < threats.length; j++) {
-        if (hypot(x - threats[j].x, y - threats[j].y) <= threats[j].R + pad) return false;
-      }
-    }
-    return true;
-  }
-
-  /**
-   * Plans a latch on planet p from comet state c ({x, y, vx, vy}): finds the
-   * release angle aimed at the next main planet, checks the heat budget, the
-   * horizon and the arc for collisions. Null when not feasible.
-   */
-  function latchPlan(run, c, p, noise) {
-    var C = cfg();
-    var cx = planetX(p, run.t), cy = p.y;
-    var relx = c.x - cx, rely = c.y - cy;
-    var d = hypot(relx, rely);
-    var theta0 = Math.atan2(rely, relx);
-    var cross = relx * c.vy - rely * c.vx;
-    var s = cross < 0 ? -1 : 1;
-    var w = C.V_ORBIT / d;
-    var rate = (p.hot ? 2 : 1) / C.T_BURN;
-    var N = nextMain(run, p);
-    var thetaR = theta0;
-    for (var it = 0; it < 2; it++) {
-      var rx = cx + d * Math.cos(thetaR), ry = cy + d * Math.sin(thetaR);
-      thetaR = aimAngle(run, rx, ry, N, noise) - s * Math.PI / 2;
-    }
-    var delta = posMod((thetaR - theta0) * s, TAU);
-    if (run.heat + (delta / w) * rate > HEAT_SAFE) return null;
-    var loop = !p.hot && d <= LOOP_R && run.heat + ((delta + TAU) / w) * rate <= HEAT_SAFE;
-    var arc = loop ? delta + TAU : delta;
-    if (cy + d * Math.sin(thetaR) - C.COMET_R < run.camBottom + 40) return null;
-    if (!arcClear(run, p, cx, cy, d, theta0, s, arc)) return null;
-    return { s: s, delta: delta, loop: loop, thetaR: thetaR };
-  }
-
   /**
    * Reference decision function: the design's scripted bot. Latches when a
-   * planned orbit is safe, releases when the tangent is within 12 degrees of
-   * the direction to the next main-chain planet (heat < 0.9), loops when the
-   * rod is <= 140 px and the heat budget allows. Pure in (run, noise).
+   * planned orbit is safe, releases when the tangent reaches the aim at the next
+   * main-chain planet (or the first safe moment within 45 degrees after it) with
+   * heat < 0.9, loops when the rod is <= 140 px and the heat budget allows, and
+   * never releases into a planet or under the horizon unless the orbit itself is
+   * about to crash. Pure in (run, noise).
    * @param {Object} run
    * @param {number} noise aim noise in radians (0 for the perfect bot)
    * @returns {boolean} desired `held`
@@ -1065,25 +1202,33 @@
       var p = getPlanet(run, T.planetId);
       var w = C.V_ORBIT / T.r;
       var rate = (p.hot ? 2 : 1) / C.T_BURN;
-      var N = nextMain(run, p);
-      var aim = aimAngle(run, c.x, c.y, N, noise);
-      var tangent = T.theta + T.s * Math.PI / 2;
+      var boost = 1 + C.HOT_BOOST * run.heat;
+      var releaseDanger = pathDeadly(run, run.t, c.x, c.y, c.vx * boost, c.vy * boost, RELEASE_HORIZON);
+      var orbitDanger = !arcClear(run, p, T.r, T.theta, T.s, w * CRASH_HORIZON);
+      if (run.heat >= HEAT_PANIC) return false;
+      if (orbitDanger && !releaseDanger) return false;
+      var ra = releaseAngle(run, p, T.r, T.s, T.theta, run.heat, rate, noise);
+      // No reachable aim on this orbit (e.g. a park): leave at the top instead.
+      if (ra.mis > AIM_MAX_MIS) ra = releaseAngle(run, p, T.r, T.s, T.theta, run.heat, rate, noise, true);
       if (!p.hot && T.r <= LOOP_R && T.loops === 0) {
         var remaining = TAU - T.loopAcc;
-        var deltaAfter = posMod((aim - T.s * Math.PI / 2 - (T.theta + T.s * remaining)) * T.s, TAU);
-        if (run.heat + ((remaining + deltaAfter) / w) * rate <= HEAT_SAFE) return true;
+        var afterLoop = posMod((ra.thetaR - T.theta - T.s * remaining) * T.s, TAU);
+        if (run.heat + ((remaining + afterLoop) / w) * rate <= HEAT_SAFE) return true;
       }
-      if (run.heat >= HEAT_PANIC) return false;
-      var mis = angleDiff(aim, tangent);
-      var misNext = angleDiff(aim, tangent + T.s * w / C.SIM_HZ);
-      if (Math.abs(mis) <= ALIGN_RAD && Math.abs(misNext) >= Math.abs(mis)) return false;
+      var ahead = ra.delta > Math.PI ? ra.delta - TAU : ra.delta;
+      if (ahead <= 0.5 * w / C.SIM_HZ && ahead >= -LATE_RAD && !releaseDanger) return false;
       return true;
     }
-    var tg = getTarget(run);
+    var pc = predictComet(run);
+    var tg = selectTarget(run, pc);
+    var imminent = pathDeadly(run, run.t, c.x, c.y, c.vx, c.vy, CRASH_HORIZON);
     if (!tg) return false;
-    if (latchPlan(run, predictComet(run), tg.planet, noise)) return true;
-    if (collisionImminent(run, CRASH_HORIZON)) return true;
-    return c.vy < 0 && c.y - run.camBottom < 300 && tg.color !== 'red';
+    if (run.releaseInfo && tg.planet.id === run.releaseInfo.planetId && !imminent && c.vy > 0) return false;
+    if (latchPlan(run, pc, tg.planet, noise)) return true;
+    if (imminent) return true;
+    var passing = (tg.cx - pc.x) * pc.vx + (tg.cy - pc.y) * pc.vy < 0 || pc.vy < 0;
+    if (passing && parkPlan(run, pc, tg.planet, PARK_ARC)) return true;
+    return c.vy < 0 && c.y - run.camBottom < 300 && parkPlan(run, pc, tg.planet, C.V_ORBIT / tg.d * CRASH_HORIZON);
   }
 
   /**
@@ -1096,11 +1241,15 @@
   }
 
   /**
-   * Clumsy bot: ±noiseDeg of aim noise (re-rolled at every latch) and a reaction
-   * delay (default 150 ms) between deciding to press / release and doing it.
-   * Per-run state lives in opts.state (created on first call).
+   * Clumsy bot: ±noiseDeg of aim noise (re-rolled for every press, i.e. every
+   * tether episode) on every release, and a reaction delay (default 150 ms) on
+   * presses: the press is decided on the state the player anticipates delayMs
+   * ahead and lands delayMs later, so planned latches are roughly on time while
+   * emergencies (imminent crashes, falling) are reacted to late. Release timing
+   * is anticipated like a human tracking a periodic motion; its error is the aim
+   * noise. Per-run state lives in opts.state (created on first call).
    * @param {Object} run
-   * @param {function(): number} rng seeded source of noise
+   * @param {function(): number} [rng] seeded source of noise (default: a stream derived from run.seed)
    * @param {{noiseDeg?:number, delayMs?:number, state?:Object}} [opts]
    * @returns {{held:boolean}}
    */
@@ -1108,24 +1257,51 @@
     opts = opts || {};
     var noiseDeg = opts.noiseDeg === undefined ? 25 : opts.noiseDeg;
     var delayMs = opts.delayMs === undefined ? 150 : opts.delayMs;
+    var delaySteps = Math.round(delayMs / 1000 * cfg().SIM_HZ);
     var st = opts.state;
     if (!st) {
-      st = opts.state = { hand: false, pendingAt: -1, pendingVal: false, noise: 0, latchSeen: -1 };
+      // No rng given: a stream derived from the run seed keeps the bot deterministic.
+      if (typeof rng !== 'function') rng = mulberry32(hashSeedForChunk(run.seed, 0x51));
+      st = opts.state = { rng: rng, hand: false, pendingAt: -1, noise: (rng() * 2 - 1) * noiseDeg * Math.PI / 180 };
     }
-    if (st.latchSeen !== run.counters.latches) {
-      st.latchSeen = run.counters.latches;
-      st.noise = (rng() * 2 - 1) * noiseDeg * Math.PI / 180;
-    }
-    if (st.pendingAt >= 0) {
-      if (run.step >= st.pendingAt) { st.hand = st.pendingVal; st.pendingAt = -1; }
+    rng = typeof rng === 'function' ? rng : st.rng;
+    if (st.hand) {
+      st.hand = decide(run, st.noise);
+      st.pendingAt = -1;
       return { held: st.hand };
     }
-    var intent = decide(run, st.noise);
-    if (intent !== st.hand) {
-      st.pendingAt = run.step + Math.round(delayMs / 1000 * cfg().SIM_HZ);
-      st.pendingVal = intent;
+    if (st.pendingAt < 0) {
+      // A fresh aim error for the episode this press will start; the plan that
+      // triggers the press is validated with the same error it will fly with.
+      var noise = (rng() * 2 - 1) * noiseDeg * Math.PI / 180;
+      if (decide(anticipate(run, delaySteps), noise)) { st.pendingAt = run.step + delaySteps; st.noise = noise; }
     }
+    if (st.pendingAt >= 0 && run.step >= st.pendingAt) { st.hand = true; st.pendingAt = -1; }
     return { held: st.hand };
+  }
+
+  /**
+   * Read-only view of the run as a player anticipates it `steps` later while
+   * flying (ballistic comet, cooled heat, advanced time). Presses are decided on
+   * this view and land `steps` later, so a planned latch is roughly on time while
+   * anything unforeseen (walls, emergencies) is reacted to late.
+   */
+  function anticipate(run, steps) {
+    if (run.state !== STATES.FLIGHT) return run;
+    var C = cfg();
+    var dt = 1 / C.SIM_HZ;
+    var c = run.comet;
+    var x = c.x, y = c.y, vx = c.vx, vy = c.vy;
+    for (var i = 0; i < steps; i++) {
+      vy -= C.GRAVITY * dt;
+      x += vx * dt;
+      y += vy * dt;
+    }
+    var view = Object.create(run);
+    view.comet = { x: x, y: y, vx: vx, vy: vy };
+    view.heat = Math.max(0, run.heat - steps * dt / C.T_COOL);
+    view.t = run.t + steps * dt;
+    return view;
   }
 
   /* ------------------------------------------------------------------ */
@@ -1150,6 +1326,6 @@
     onHotShot: onHotShot,
     onLongShot: onLongShot,
     onLoop: onLoop,
-    bots: { perfect: perfect, clumsy: clumsy, decide: decide, latchPlan: latchPlan, nextMain: nextMain }
+    bots: { perfect: perfect, clumsy: clumsy, decide: decide, latchPlan: latchPlan, releaseAngle: releaseAngle, nextMain: nextMain }
   };
 })();
